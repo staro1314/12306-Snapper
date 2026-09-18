@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+*.db
+*.db-shm
+*.db-wal
+.env
+playwright-profile/
+.browser-session/
+.local-data/
+.playwright-cli/

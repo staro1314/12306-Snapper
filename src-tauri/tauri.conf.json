@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Fast 12306",
+  "version": "0.1.0",
+  "identifier": "com.fast12306.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{
+      "title": "Fast 12306",
+      "width": 1280,
+      "height": 820,
+      "minWidth": 860,
+      "minHeight": 640,
+      "resizable": true
+    }],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "windows": { "nsis": { "installMode": "currentUser" } }
+  }
+}
+

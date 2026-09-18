@@ -1,0 +1,27 @@
+{
+  "name": "fast-12306",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "cargo run --manifest-path src-tauri/Cargo.toml --bin web-server",
+    "dev:browser": "node scripts/browser-session.mjs",
+    "dev:web": "concurrently -k -n api,browser,web -c cyan,magenta,green \"npm:dev:api\" \"npm:dev:browser\" \"npm:dev\"",
+    "build": "vue-tsc --noEmit && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "playwright-core": "^1.55.0",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vue-tsc": "^3.1.1"
+  }
+}

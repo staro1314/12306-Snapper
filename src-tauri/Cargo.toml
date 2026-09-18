@@ -1,0 +1,25 @@
+[package]
+name = "fast-12306"
+version = "0.1.0"
+description = "Personal 12306 booking automation with fail-closed protocol gates"
+edition = "2024"
+
+[lib]
+name = "fast_12306_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4", "serde"] }
