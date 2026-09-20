@@ -13,6 +13,9 @@ const realSubmissionEnabled = process.env.FAST_12306_ENABLE_REAL_SUBMISSION === 
 let context;
 let page;
 let polling;
+let browserHeadless = false;
+let suppressCloseRecovery = false;
+let recoveryTimer;
 const observations = [];
 let passengerSnapshot = [];
 const passengerSecrets = new Map();
@@ -168,32 +171,54 @@ function attachReadOnlyObserver(targetPage) {
   });
 }
 
-async function startBrowser() {
+async function startBrowser({ headless = false } = {}) {
   if (context) {
-    const pages = context.pages();
-    page = pages[0] ?? await context.newPage();
-    await page.bringToFront();
-    return status;
+    if (browserHeadless && !headless) {
+      suppressCloseRecovery = true;
+      await context.close();
+      suppressCloseRecovery = false;
+      context = undefined;
+      page = undefined;
+    } else {
+      const pages = context.pages();
+      page = pages[0] ?? await context.newPage();
+      if (!headless) await page.bringToFront();
+      return status;
+    }
   }
-  await updateStatus("starting", "正在启动持久化 Chrome");
+  await updateStatus("starting", headless ? "正在恢复后台 12306 会话" : "正在启动持久化 Chrome");
   await mkdir(profileDir, { recursive: true });
   context = await chromium.launchPersistentContext(profileDir, {
     channel: "chrome",
-    headless: false,
+    headless,
     viewport: null,
-    args: ["--start-maximized"],
+    args: headless ? [] : ["--start-maximized"],
   });
+  browserHeadless = headless;
   page = context.pages()[0] ?? await context.newPage();
   for (const openPage of context.pages()) attachReadOnlyObserver(openPage);
   context.on("page", attachReadOnlyObserver);
   await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
-  await updateStatus("awaiting_login", "请在打开的 12306 官方窗口中扫码并完成必要核验");
+  await updateStatus(headless ? "starting" : "awaiting_login", headless ? "登录窗口已关闭，后台正在保持会话" : "请在打开的 12306 官方窗口中扫码并完成必要核验");
   polling = setInterval(inspectLoginState, 2000);
-  context.on("close", () => { clearInterval(polling); context = undefined; page = undefined; updateStatus("closed", "登录浏览器已关闭"); });
+  context.on("close", () => {
+    clearInterval(polling);
+    polling = undefined;
+    context = undefined;
+    page = undefined;
+    if (!suppressCloseRecovery && status.state === "logged_in") {
+      clearTimeout(recoveryTimer);
+      recoveryTimer = setTimeout(() => startBrowser({ headless: true }).catch((error) => updateStatus("closed", `官方窗口已关闭，后台会话恢复失败：${error.message}`)), 800);
+    } else if (!suppressCloseRecovery) {
+      updateStatus("closed", "登录浏览器已关闭");
+    }
+  });
   return status;
 }
 
 async function logoutBrowser() {
+  clearTimeout(recoveryTimer);
+  suppressCloseRecovery = true;
   if (polling) clearInterval(polling);
   polling = undefined;
   passengerSnapshot = [];
@@ -202,8 +227,10 @@ async function logoutBrowser() {
     await context.clearCookies();
     await context.close();
   }
+  suppressCloseRecovery = false;
   context = undefined;
   page = undefined;
+  browserHeadless = false;
   await updateStatus("idle", "已退出 12306，会话已从本机浏览器清除");
   return status;
 }
