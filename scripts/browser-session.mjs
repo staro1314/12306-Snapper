@@ -193,6 +193,21 @@ async function startBrowser() {
   return status;
 }
 
+async function logoutBrowser() {
+  if (polling) clearInterval(polling);
+  polling = undefined;
+  passengerSnapshot = [];
+  passengerSecrets.clear();
+  if (context) {
+    await context.clearCookies();
+    await context.close();
+  }
+  context = undefined;
+  page = undefined;
+  await updateStatus("idle", "已退出 12306，会话已从本机浏览器清除");
+  return status;
+}
+
 function send(response, code, payload) {
   response.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   response.end(JSON.stringify(payload));
@@ -215,6 +230,7 @@ http.createServer(async (request, response) => {
       if (!["127.0.0.1", "localhost", "::1"].includes(originHost)) return send(response, 403, { error: "拒绝非本机网页调用" });
     }
     if (request.method === "GET" && request.url === "/status") return send(response, 200, status);
+    if (request.method === "POST" && request.url === "/logout") return send(response, 200, await logoutBrowser());
     if (request.method === "GET" && request.url === "/capabilities") return send(response, 200, { queryEnabled: true, realSubmissionEnabled });
     if (request.method === "GET" && request.url === "/official-clock") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", now: officialClock?.epochMs ?? officialClock?.nowStr ?? null });
     if (request.method === "GET" && request.url === "/stations") {

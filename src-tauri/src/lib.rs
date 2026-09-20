@@ -80,6 +80,8 @@ fn complete_query(state: tauri::State<'_, AppState>, task_id: String) -> Result<
 #[tauri::command]
 fn halt_task(state: tauri::State<'_, AppState>, task_id: String, input: HaltTaskInput) -> Result<TicketTaskView, String> { state.halt_task(&task_id, input) }
 #[tauri::command]
+fn abandon_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<TicketTaskView, String> { state.abandon_task(&task_id) }
+#[tauri::command]
 fn begin_order(state: tauri::State<'_, AppState>, task_id: String) -> Result<TicketTaskView, String> { state.begin_order(&task_id) }
 #[tauri::command]
 fn mark_order_submitting(state: tauri::State<'_, AppState>, task_id: String) -> Result<TicketTaskView, String> { state.mark_order_submitting(&task_id) }
@@ -135,6 +137,7 @@ pub fn run() {
             begin_query,
             complete_query,
             halt_task,
+            abandon_task,
             begin_order,
             mark_order_submitting,
             pause_all_automation,
@@ -152,7 +155,7 @@ mod tests {
     use chrono::{Duration, NaiveDate, Utc};
 
     use crate::domain::{
-        CreateTaskInput, OfficialOrderStatus, PassengerSelection, RecordOrderResultInput,
+        CreateTaskInput, HaltTaskInput, OfficialOrderStatus, PassengerSelection, RecordOrderResultInput,
         RouteGroup, TaskStatus, TicketCandidate, TicketTask, select_candidate, select_query_batch,
     };
     use crate::AppState;
@@ -375,6 +378,44 @@ mod tests {
         assert_eq!(inflight.status, TaskStatus::UnknownReconciling);
         assert_eq!(armed.status, TaskStatus::UserActionRequired);
         assert_eq!(inflight.failure_reason.as_deref(), Some("登录核验触发，已安全停止"));
+        drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn stopped_task_can_be_deleted_but_order_task_is_protected() {
+        let database_path = std::env::temp_dir().join(format!("fast-12306-delete-{}.db", uuid::Uuid::new_v4()));
+        let state = AppState::open(database_path.clone()).unwrap();
+        let create = |name: &str, passenger_ref: &str| CreateTaskInput {
+            name: name.into(), priority: 1, split_authorized: false,
+            passengers: vec![passenger(passenger_ref, 1)], deadline: None,
+            route_groups: vec![RouteGroup {
+                id: uuid::Uuid::new_v4().to_string(),
+                travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                from_station: "北京南".into(), to_station: "上海虹桥".into(),
+                sale_time: Utc::now() - Duration::seconds(1), priority: 1,
+                train_codes: vec!["G1".into()], seat_types: vec!["二等座".into()],
+            }],
+        };
+        let stopped_id = state.create_task(create("stopped", "p-stopped")).unwrap().id;
+        state.halt_task(&stopped_id, HaltTaskInput { status: TaskStatus::UserActionRequired, reason: "manual stop".into() }).unwrap();
+        state.delete_task(&stopped_id).unwrap();
+        assert!(state.get_task(&stopped_id).is_err());
+
+        let order_id = state.create_task(create("order", "p-order")).unwrap().id;
+        state.run_preflight(&order_id).unwrap();
+        state.arm_task(&order_id).unwrap();
+        state.begin_query(&order_id).unwrap();
+        state.record_order_result(RecordOrderResultInput {
+            task_id: order_id.clone(), official_order_ref: Some("protected-order".into()),
+            status: OfficialOrderStatus::PaymentPending, passenger_refs: vec!["p-order".into()],
+            payment_deadline: None, partial: false,
+        }).unwrap();
+        assert!(state.delete_task(&order_id).is_err());
+        assert_eq!(state.list_order_snapshots().unwrap().len(), 1);
+        state.abandon_task(&order_id).unwrap();
+        state.delete_task(&order_id).unwrap();
+        assert_eq!(state.list_order_snapshots().unwrap().len(), 1);
         drop(state);
         let _ = std::fs::remove_file(database_path);
     }

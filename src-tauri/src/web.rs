@@ -68,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tasks/{task_id}/query/start", post(begin_query))
         .route("/api/tasks/{task_id}/query/complete", post(complete_query))
         .route("/api/tasks/{task_id}/halt", post(halt_task))
+        .route("/api/tasks/{task_id}/abandon", post(abandon_task))
         .route("/api/tasks/{task_id}/order/begin", post(begin_order))
         .route("/api/tasks/{task_id}/order/submitting", post(mark_order_submitting))
         .route("/api/tasks/{task_id}/rehearsal", post(run_rehearsal))
@@ -188,6 +189,7 @@ async fn pause_task(
 async fn begin_query(State(state): State<Arc<AppState>>, Path(task_id): Path<String>) -> Result<Json<TicketTaskView>, ApiError> { state.begin_query(&task_id).map(Json).map_err(ApiError) }
 async fn complete_query(State(state): State<Arc<AppState>>, Path(task_id): Path<String>) -> Result<Json<TicketTaskView>, ApiError> { state.complete_query(&task_id).map(Json).map_err(ApiError) }
 async fn halt_task(State(state): State<Arc<AppState>>, Path(task_id): Path<String>, Json(input): Json<HaltTaskInput>) -> Result<Json<TicketTaskView>, ApiError> { state.halt_task(&task_id, input).map(Json).map_err(ApiError) }
+async fn abandon_task(State(state): State<Arc<AppState>>, Path(task_id): Path<String>) -> Result<Json<TicketTaskView>, ApiError> { state.abandon_task(&task_id).map(Json).map_err(ApiError) }
 async fn begin_order(State(state): State<Arc<AppState>>, Path(task_id): Path<String>) -> Result<Json<TicketTaskView>, ApiError> { state.begin_order(&task_id).map(Json).map_err(ApiError) }
 async fn mark_order_submitting(State(state): State<Arc<AppState>>, Path(task_id): Path<String>) -> Result<Json<TicketTaskView>, ApiError> { state.mark_order_submitting(&task_id).map(Json).map_err(ApiError) }
 

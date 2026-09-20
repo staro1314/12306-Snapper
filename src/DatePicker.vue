@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 
-const props = defineProps<{ modelValue: string; label: string; withTime?: boolean; optional?: boolean }>();
+const props = defineProps<{ modelValue: string; label: string; withTime?: boolean; optional?: boolean; minDate?: string }>();
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>();
 const open = ref(false);
 const month = ref(new Date().getMonth());
@@ -31,6 +31,7 @@ function moveMonth(offset: number) {
   year.value = next.getFullYear(); month.value = next.getMonth();
 }
 function choose(value: string) {
+  if (props.minDate && value < props.minDate) return;
   selected.value = value;
   if (!props.withTime) commit();
 }
@@ -56,7 +57,7 @@ function commit() {
       <div class="calendar-days">
         <span v-for="day in ['一','二','三','四','五','六','日']" :key="day">{{ day }}</span>
         <template v-for="(day, index) in days" :key="index">
-          <button v-if="day" type="button" :aria-label="day" :aria-pressed="selected === day" :class="{ selected: selected === day }" @click="choose(day)">{{ Number(day.slice(-2)) }}</button>
+          <button v-if="day" type="button" :aria-label="day" :aria-current="selected === day ? 'date' : undefined" :disabled="Boolean(minDate && day < minDate)" :class="{ selected: selected === day }" @click="choose(day)">{{ Number(day.slice(-2)) }}</button>
           <span v-else />
         </template>
       </div>
@@ -80,6 +81,8 @@ function commit() {
 .calendar-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; margin: 10px 0; text-align: center; }
 .calendar-days > span { min-height: 26px; padding: 5px; color: #91a5bd; }
 .calendar-days button:hover,.calendar-days button.selected { background: #5ce1c2; color: #07101c; }
+.calendar-days button:disabled { color: #52667d; cursor: not-allowed; opacity: .55; }
+.calendar-days button:disabled:hover { background: transparent; color: #52667d; }
 .calendar-time { display: flex; align-items: center; gap: 6px; padding-top: 10px; border-top: 1px solid #2b3d53; }
 .calendar-time select { min-width: 0; flex: 1; }.calendar-time button { padding: 8px; }
 </style>

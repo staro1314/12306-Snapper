@@ -47,6 +47,7 @@ export async function pauseTask(taskId: string): Promise<TicketTaskView> { retur
 export async function beginTaskQuery(taskId: string): Promise<TicketTaskView> { return inTauri() ? invoke("begin_query", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/query/start`, { method: "POST" }); }
 export async function completeTaskQuery(taskId: string): Promise<TicketTaskView> { return inTauri() ? invoke("complete_query", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/query/complete`, { method: "POST" }); }
 export async function haltTask(taskId: string, status: "RATE_LIMITED" | "USER_ACTION_REQUIRED" | "INCOMPATIBLE" | "FAILED" | "UNKNOWN_RECONCILING", reason: string): Promise<TicketTaskView> { return inTauri() ? invoke("halt_task", { taskId, input: { status, reason } }) : request(`/tasks/${encodeURIComponent(taskId)}/halt`, { method: "POST", body: JSON.stringify({ status, reason }) }); }
+export async function abandonTask(taskId: string): Promise<TicketTaskView> { return inTauri() ? invoke("abandon_task", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/abandon`, { method: "POST" }); }
 export async function beginOrder(taskId: string): Promise<TicketTaskView> { return inTauri() ? invoke("begin_order", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/order/begin`, { method: "POST" }); }
 export async function markOrderSubmitting(taskId: string): Promise<TicketTaskView> { return inTauri() ? invoke("mark_order_submitting", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/order/submitting`, { method: "POST" }); }
 export async function pauseAllAutomation(reason: string): Promise<TicketTaskView[]> { return inTauri() ? invoke("pause_all_automation", { reason }) : request("/safety/pause", { method: "POST", body: JSON.stringify({ reason }) }); }
@@ -76,6 +77,12 @@ export async function startBrowserSession(): Promise<BrowserSessionStatus> {
   const response = await fetch("/browser/start", { method: "POST" });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error ?? "无法启动 12306 登录浏览器");
+  return payload as BrowserSessionStatus;
+}
+export async function logoutBrowserSession(): Promise<BrowserSessionStatus> {
+  const response = await fetch("/browser/logout", { method: "POST" });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error ?? "退出 12306 失败");
   return payload as BrowserSessionStatus;
 }
 export async function syncPassengers(): Promise<OfficialPassenger[]> {

@@ -118,10 +118,9 @@ impl AppState {
                 | TaskStatus::Failed
                 | TaskStatus::UserActionRequired
                 | TaskStatus::RateLimited
-                | TaskStatus::Expired
                 | TaskStatus::Cancelled
         ) {
-            return Err("运行中或已产生订单的任务不能删除".into());
+            return Err("请先放弃任务；订单提交或核对中的任务不能删除".into());
         }
         self.repository.lock().delete(task_id)?;
         tasks.remove(index);
@@ -248,6 +247,18 @@ impl AppState {
         let task = tasks.iter_mut().find(|task| task.id == task_id).ok_or("任务不存在")?;
         task.status = input.status;
         task.failure_reason = Some(input.reason.chars().take(180).collect());
+        self.repository.lock().save(task)?;
+        Ok(TicketTaskView::from(&*task))
+    }
+
+    pub fn abandon_task(&self, task_id: &str) -> Result<TicketTaskView, String> {
+        let mut tasks = self.tasks.write();
+        let task = tasks.iter_mut().find(|task| task.id == task_id).ok_or("任务不存在")?;
+        if matches!(task.status, TaskStatus::CandidateSelected | TaskStatus::OrderInitializing | TaskStatus::OrderSubmitting | TaskStatus::Queuing | TaskStatus::UnknownReconciling) {
+            return Err("订单结果核对中，不能放弃任务；请先完成官方订单核对".into());
+        }
+        task.status = TaskStatus::Cancelled;
+        task.failure_reason = Some("用户已放弃本地任务；已有官方订单不会被取消".into());
         self.repository.lock().save(task)?;
         Ok(TicketTaskView::from(&*task))
     }
