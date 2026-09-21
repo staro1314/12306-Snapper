@@ -14,6 +14,7 @@ const activeView = ref<View>("overview");
 const loginModalOpen = ref(false);
 const busy = ref(false);
 const error = ref("");
+const notice = ref("");
 const selectedTaskId = ref("");
 const scenario = ref<RehearsalScenario>("seats_available");
 const events = ref<ExecutionEvent[]>([]);
@@ -195,7 +196,7 @@ async function lookupRouteSaleTime(route: RouteDraft) {
 }
 
 async function submitTask() {
-  busy.value = true; error.value = "";
+  busy.value = true; error.value = ""; notice.value = "";
   try {
     for (const route of [form, ...additionalRoutes.value]) {
       if (!route.travelDate || !route.saleTime) throw new Error("请选择每条路线的乘车日期和官方起售时间");
@@ -214,10 +215,12 @@ async function submitTask() {
       ? tasks.value.map((item) => item.id === savedTask.id ? savedTask : item)
       : [savedTask, ...tasks.value];
     resetForm(); activeView.value = "tasks";
-    // A saved task must enter the same preflight/arming path as the manual start action.
-    // If a required gate (notification self-test, login, protocol compatibility) is not ready,
-    // startTask records USER_ACTION_REQUIRED instead of pretending that automation is armed.
-    await startTask(savedTask);
+    if (!notificationSelfTestPassed.value) {
+      notice.value = "任务已保存。自动启动前需要完成一次本机通知自检，确保生成待支付订单后能够及时提醒你。";
+      schedulerMessage.value = "任务已保存，等待完成本机通知自检";
+      return;
+    }
+    await startTask(savedTask, false);
   }
   catch (cause) { error.value = String(cause); }
   finally { busy.value = false; }
@@ -229,7 +232,7 @@ async function editTask(taskId: string) {
   catch (cause) { error.value = String(cause); } finally { busy.value = false; }
 }
 
-async function startTask(task: TicketTaskView) {
+async function startTask(task: TicketTaskView, showFailureAsError = true) {
   busy.value = true; error.value = "";
   try {
     let readyTask = task;
@@ -248,7 +251,13 @@ async function startTask(task: TicketTaskView) {
     tasks.value = tasks.value.map((item) => item.id === task.id ? updated : item);
     safetyPause.value = false;
   }
-  catch (cause) { error.value = String(cause); const updated = await haltTask(task.id, "USER_ACTION_REQUIRED", String(cause)).catch(() => null); if (updated) tasks.value = tasks.value.map((item) => item.id === task.id ? updated : item); }
+  catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    if (showFailureAsError) error.value = reason;
+    else notice.value = `任务已保存，但自动启动尚未完成：${reason}`;
+    const updated = await haltTask(task.id, "USER_ACTION_REQUIRED", reason).catch(() => null);
+    if (updated) tasks.value = tasks.value.map((item) => item.id === task.id ? updated : item);
+  }
   finally { busy.value = false; }
 }
 const editableTaskStatuses = ["DRAFT", "INCOMPATIBLE", "FAILED", "USER_ACTION_REQUIRED", "RATE_LIMITED", "EXPIRED"];
@@ -259,6 +268,8 @@ const abandonableTaskStatuses = ["READY", "ARMED", "QUERYING", "PAYMENT_PENDING"
 function canEditTask(task: TicketTaskView) { return editableTaskStatuses.includes(task.status); }
 function canStopTask(task: TicketTaskView) { return stoppableTaskStatuses.includes(task.status); }
 function canRemoveTask(task: TicketTaskView) { return removableTaskStatuses.includes(task.status); }
+function displayFailureReason(reason: string | null) { return reason?.replace(/^Error:\s*/i, "") ?? ""; }
+function needsNotificationSelfTest(task: TicketTaskView) { return !notificationSelfTestPassed.value && Boolean(task.failureReason?.includes("通知自检")); }
 async function stopTask(task: TicketTaskView) {
   busy.value = true; error.value = "";
   try { const updated = await haltTask(task.id, "USER_ACTION_REQUIRED", "用户手动停止任务"); tasks.value = tasks.value.map((item) => item.id === updated.id ? updated : item); }
@@ -515,6 +526,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
     <main class="workspace">
       <header class="topbar"><div><p>{{ viewTitle }}</p><small>所有数据仅保存在本机</small></div><div class="topbar-actions"><button v-if="browserSession?.state !== 'logged_in'" class="login-topbar-button" :disabled="busy" @click="showLogin">登录 12306 <span>↗</span></button><div v-else class="account-menu"><span class="account-state"><i></i>12306 已登录</span><button class="quiet-action" :disabled="busy" @click="logout">退出登录</button></div><button class="quiet-action" :disabled="busy" @click="refresh">刷新状态</button></div></header>
       <p v-if="error" class="error-banner">{{ error }}</p>
+      <div v-if="notice" class="notice-banner"><span>{{ notice }}</span><button v-if="!notificationSelfTestPassed" type="button" @click="activeView = 'system'; notice = ''">去完成通知自检</button><button v-else type="button" @click="notice = ''">知道了</button></div>
 
       <section v-if="!isAuthenticated && activeView !== 'login'" class="view auth-wall">
         <div class="auth-wall-card"><p class="kicker">本机数据已锁定</p><h1>请先登录 12306</h1><p>登录前不会读取或展示任务、订单、乘车人和运行日志。完成官方扫码及必要核验后，返回这里继续操作。</p><button @click="showLogin">登录 12306 <span>↗</span></button></div>
@@ -547,7 +559,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
       <section v-else-if="isAuthenticated && activeView === 'tasks'" class="view">
         <div class="view-heading"><div><p class="kicker">任务队列</p><h1>抢票任务</h1><p>查询可以有限并发，订单提交始终全局串行。</p></div><button @click="activeView = 'create'">新建任务</button></div>
         <div v-if="tasks.length === 0" class="empty"><strong>还没有任务</strong><p>完成当前 12306 协议只读验证后，任务才能进入就绪状态。</p><button @click="activeView = 'create'">创建第一个任务</button></div>
-        <article v-for="task in tasks" :key="task.id" class="task-card module"><div class="task-row"><div><small>优先级 {{ task.priority }} · {{ task.passengerCount }} 人 · {{ task.routeGroupCount }} 路线<span v-if="task.deadline"> · 截止 {{ new Date(task.deadline).toLocaleString() }}</span></small><h3>{{ task.name }}</h3><p v-if="task.failureReason" class="failure">{{ task.failureReason }}</p></div><div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div></div><div v-if="queryTaskId === task.id" class="query-results"><div class="query-result-head"><strong>{{ queryMessage }}</strong><span>数据来自当前 12306 官方只读查询</span></div><div v-for="candidate in queryCandidates.slice(0, 20)" :key="candidate.trainInternalRef" class="train-row"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }} → {{ candidate.arrivalTime }}</span><span>{{ candidate.duration }}</span><small>{{ seatSummary(candidate) }}</small></div><p v-if="!queryCandidates.length">本次没有可展示的候选车次。</p></div></article>
+        <article v-for="task in tasks" :key="task.id" class="task-card module"><div class="task-row"><div><small>优先级 {{ task.priority }} · {{ task.passengerCount }} 人 · {{ task.routeGroupCount }} 路线<span v-if="task.deadline"> · 截止 {{ new Date(task.deadline).toLocaleString() }}</span></small><h3>{{ task.name }}</h3><p v-if="task.failureReason" class="failure">{{ displayFailureReason(task.failureReason) }}</p></div><div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button v-if="needsNotificationSelfTest(task)" class="secondary" :disabled="busy" @click="activeView = 'system'">完成通知自检</button><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div></div><div v-if="queryTaskId === task.id" class="query-results"><div class="query-result-head"><strong>{{ queryMessage }}</strong><span>数据来自当前 12306 官方只读查询</span></div><div v-for="candidate in queryCandidates.slice(0, 20)" :key="candidate.trainInternalRef" class="train-row"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }} → {{ candidate.arrivalTime }}</span><span>{{ candidate.duration }}</span><small>{{ seatSummary(candidate) }}</small></div><p v-if="!queryCandidates.length">本次没有可展示的候选车次。</p></div></article>
       </section>
 
       <section v-else-if="isAuthenticated && activeView === 'create'" class="view create-view">

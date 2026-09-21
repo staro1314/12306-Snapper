@@ -108,6 +108,8 @@ nav button.active { color: #17312c; background: #e8f7f3; box-shadow: inset 3px 0
 .login-topbar-button,.login-primary { color: #07372e; border-color: #49c9ad; background: #55d6ba; }
 .account-state,.login-message,.login-lede,.login-points,.login-state p,.passenger-summary,.passenger-empty,.route-tools,.query-result-head,.train-row { color: #61758a; }
 .error-banner { color: #a43542; border-color: #e8b7bd; background: #fff0f2; }
+.notice-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 18px 34px 0; padding: 12px 16px; border: 1px solid #c9dfd9; border-radius: 4px; color: #276659; background: #effaf7; }
+.notice-banner button { flex: 0 0 auto; padding: 7px 10px; color: #0d6958; border: 1px solid #9bcfc3; background: #ffffff; }
 input,select,.selection-output,.date-trigger { color: #17212b !important; border-color: #cbd6de !important; background: #ffffff !important; }
 input::placeholder { color: #94a2af; }
 input:focus,select:focus { border-color: #3ebda2; box-shadow: 0 0 0 3px rgba(62,189,162,.13); }
