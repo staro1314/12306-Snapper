@@ -22,7 +22,7 @@ export interface PassengerSelection {
   priority: number;
   verified: boolean;
 }
-export interface OfficialPassenger extends PassengerSelection { ticketTypeLabel: string; }
+export interface OfficialPassenger extends PassengerSelection { ticketTypeLabel: string; officialActive?: boolean; }
 
 export interface RouteGroupInput {
   id: string;

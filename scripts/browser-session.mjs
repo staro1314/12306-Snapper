@@ -161,9 +161,12 @@ function attachReadOnlyObserver(targetPage) {
               ticketType: typeName.includes("学生") ? "student" : typeName.includes("儿童") ? "child" : "adult",
               ticketTypeLabel: typeName,
               priority: index + 1,
-              // Current official page uses is_active=Y for an active/verified passenger record.
-              // is_buy_ticket is N for all observed records and is not treated as verification.
-              verified: item.is_active === true || item.is_active === "Y" || item.is_active === "1" || item.is_active === 1,
+              // The authenticated passenger list is the source of truth for records that the
+              // official booking page can present. is_active is retained as an observation only:
+              // it is not equivalent to whether the passenger can be selected on the order page.
+              // The order preflight remains the final guard because it checks the live official form.
+              officialActive: item.is_active === true || item.is_active === "Y" || item.is_active === "1" || item.is_active === 1,
+              verified: true,
             };
           });
         }
