@@ -204,9 +204,17 @@ async function submitTask() {
     routeGroups: [{ id: editingTask.value?.routeGroups[0]?.id ?? crypto.randomUUID(), travelDate: form.travelDate, fromStation: form.fromStation.trim(), toStation: form.toStation.trim(), saleTime: new Date(form.saleTime).toISOString(), priority: editingTask.value?.routeGroups[0]?.priority ?? 1, trainCodes: form.trainCodes.split(/[,，\s]+/).filter(Boolean), seatTypes: form.seatTypes.split(/[,，\s]+/).filter(Boolean) }, ...additionalRoutes.value.map((route) => ({ id: route.id, travelDate: route.travelDate, fromStation: route.fromStation.trim(), toStation: route.toStation.trim(), saleTime: new Date(route.saleTime).toISOString(), priority: route.priority, trainCodes: route.trainCodes.split(/[,，\s]+/).filter(Boolean), seatTypes: route.seatTypes.split(/[,，\s]+/).filter(Boolean) }))],
     deadline: form.deadline ? new Date(form.deadline).toISOString() : null,
   };
-    if (editingTaskId.value) { const task = await updateTask(editingTaskId.value, input); tasks.value = tasks.value.map((item) => item.id === task.id ? task : item); }
-    else { const task = await createTask(input); tasks.value = [task, ...tasks.value]; }
+    const savedTask = editingTaskId.value
+      ? await updateTask(editingTaskId.value, input)
+      : await createTask(input);
+    tasks.value = editingTaskId.value
+      ? tasks.value.map((item) => item.id === savedTask.id ? savedTask : item)
+      : [savedTask, ...tasks.value];
     resetForm(); activeView.value = "tasks";
+    // A saved task must enter the same preflight/arming path as the manual start action.
+    // If a required gate (notification self-test, login, protocol compatibility) is not ready,
+    // startTask records USER_ACTION_REQUIRED instead of pretending that automation is armed.
+    await startTask(savedTask);
   }
   catch (cause) { error.value = String(cause); }
   finally { busy.value = false; }
