@@ -34,6 +34,17 @@ impl AppState {
             } else if task.status == TaskStatus::Querying {
                 task.status = TaskStatus::Armed;
                 repository.save(task)?;
+            } else if task.status == TaskStatus::UserActionRequired
+                && task
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("运行并确认本机通知自检"))
+            {
+                // Notification testing used to be an incorrect startup gate. Restore only
+                // tasks stopped by that exact obsolete rule; genuine security stops remain.
+                task.status = TaskStatus::Draft;
+                task.failure_reason = None;
+                repository.save(task)?;
             }
         }
         Ok(Self {

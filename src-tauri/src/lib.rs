@@ -251,6 +251,42 @@ mod tests {
     }
 
     #[test]
+    fn restart_clears_only_obsolete_notification_gate_failures() {
+        let database_path = std::env::temp_dir().join(format!("fast-12306-notification-gate-{}.db", uuid::Uuid::new_v4()));
+        let task_id;
+        {
+            let state = AppState::open(database_path.clone()).unwrap();
+            task_id = state.create_task(CreateTaskInput {
+                name: "notification migration".into(),
+                priority: 1,
+                split_authorized: false,
+                real_submission_authorized: false,
+                passengers: vec![passenger("p1", 1)],
+                route_groups: vec![RouteGroup {
+                    id: "r1".into(),
+                    travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                    from_station: "北京南".into(),
+                    to_station: "上海虹桥".into(),
+                    sale_time: Utc::now() + Duration::hours(1),
+                    priority: 1,
+                    train_codes: vec!["G1".into()],
+                    seat_types: vec!["二等座".into()],
+                }],
+                deadline: None,
+            }).unwrap().id;
+            state.halt_task(&task_id, HaltTaskInput {
+                status: TaskStatus::UserActionRequired,
+                reason: "Error: 请先在“系统与协议”运行并确认本机通知自检".into(),
+            }).unwrap();
+        }
+        let recovered = AppState::open(database_path.clone()).unwrap();
+        let task = recovered.get_task(&task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Draft);
+        assert_eq!(task.failure_reason, None);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
     fn official_order_is_atomic_and_freezes_conflicting_tasks_after_reload() {
         let database_path = std::env::temp_dir().join(format!("fast-12306-test-{}.db", uuid::Uuid::new_v4()));
         let route = || RouteGroup {

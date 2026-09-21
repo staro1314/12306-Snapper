@@ -215,11 +215,6 @@ async function submitTask() {
       ? tasks.value.map((item) => item.id === savedTask.id ? savedTask : item)
       : [savedTask, ...tasks.value];
     resetForm(); activeView.value = "tasks";
-    if (!notificationSelfTestPassed.value) {
-      notice.value = "任务已保存。自动启动前需要完成一次本机通知自检，确保生成待支付订单后能够及时提醒你。";
-      schedulerMessage.value = "任务已保存，等待完成本机通知自检";
-      return;
-    }
     await startTask(savedTask, false);
   }
   catch (cause) { error.value = String(cause); }
@@ -237,7 +232,6 @@ async function startTask(task: TicketTaskView, showFailureAsError = true) {
   try {
     let readyTask = task;
     if (task.status !== "READY") {
-      if (!notificationSelfTestPassed.value) throw new Error("请先在“系统与协议”运行并确认本机通知自检");
       const detail = await getTask(task.id);
       await runOfficialPreflight(detail.passengers.map((passenger) => passenger.passengerRef));
       await synchronizeOfficialClock();
@@ -269,7 +263,6 @@ function canEditTask(task: TicketTaskView) { return editableTaskStatuses.include
 function canStopTask(task: TicketTaskView) { return stoppableTaskStatuses.includes(task.status); }
 function canRemoveTask(task: TicketTaskView) { return removableTaskStatuses.includes(task.status); }
 function displayFailureReason(reason: string | null) { return reason?.replace(/^Error:\s*/i, "") ?? ""; }
-function needsNotificationSelfTest(task: TicketTaskView) { return !notificationSelfTestPassed.value && Boolean(task.failureReason?.includes("通知自检")); }
 async function stopTask(task: TicketTaskView) {
   busy.value = true; error.value = "";
   try { const updated = await haltTask(task.id, "USER_ACTION_REQUIRED", "用户手动停止任务"); tasks.value = tasks.value.map((item) => item.id === updated.id ? updated : item); }
@@ -526,7 +519,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
     <main class="workspace">
       <header class="topbar"><div><p>{{ viewTitle }}</p><small>所有数据仅保存在本机</small></div><div class="topbar-actions"><button v-if="browserSession?.state !== 'logged_in'" class="login-topbar-button" :disabled="busy" @click="showLogin">登录 12306 <span>↗</span></button><div v-else class="account-menu"><span class="account-state"><i></i>12306 已登录</span><button class="quiet-action" :disabled="busy" @click="logout">退出登录</button></div><button class="quiet-action" :disabled="busy" @click="refresh">刷新状态</button></div></header>
       <p v-if="error" class="error-banner">{{ error }}</p>
-      <div v-if="notice" class="notice-banner"><span>{{ notice }}</span><button v-if="!notificationSelfTestPassed" type="button" @click="activeView = 'system'; notice = ''">去完成通知自检</button><button v-else type="button" @click="notice = ''">知道了</button></div>
+      <div v-if="notice" class="notice-banner"><span>{{ notice }}</span><button type="button" @click="notice = ''">知道了</button></div>
 
       <section v-if="!isAuthenticated && activeView !== 'login'" class="view auth-wall">
         <div class="auth-wall-card"><p class="kicker">本机数据已锁定</p><h1>请先登录 12306</h1><p>登录前不会读取或展示任务、订单、乘车人和运行日志。完成官方扫码及必要核验后，返回这里继续操作。</p><button @click="showLogin">登录 12306 <span>↗</span></button></div>
@@ -559,7 +552,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
       <section v-else-if="isAuthenticated && activeView === 'tasks'" class="view">
         <div class="view-heading"><div><p class="kicker">任务队列</p><h1>抢票任务</h1><p>查询可以有限并发，订单提交始终全局串行。</p></div><button @click="activeView = 'create'">新建任务</button></div>
         <div v-if="tasks.length === 0" class="empty"><strong>还没有任务</strong><p>完成当前 12306 协议只读验证后，任务才能进入就绪状态。</p><button @click="activeView = 'create'">创建第一个任务</button></div>
-        <article v-for="task in tasks" :key="task.id" class="task-card module"><div class="task-row"><div><small>优先级 {{ task.priority }} · {{ task.passengerCount }} 人 · {{ task.routeGroupCount }} 路线<span v-if="task.deadline"> · 截止 {{ new Date(task.deadline).toLocaleString() }}</span></small><h3>{{ task.name }}</h3><p v-if="task.failureReason" class="failure">{{ displayFailureReason(task.failureReason) }}</p></div><div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button v-if="needsNotificationSelfTest(task)" class="secondary" :disabled="busy" @click="activeView = 'system'">完成通知自检</button><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div></div><div v-if="queryTaskId === task.id" class="query-results"><div class="query-result-head"><strong>{{ queryMessage }}</strong><span>数据来自当前 12306 官方只读查询</span></div><div v-for="candidate in queryCandidates.slice(0, 20)" :key="candidate.trainInternalRef" class="train-row"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }} → {{ candidate.arrivalTime }}</span><span>{{ candidate.duration }}</span><small>{{ seatSummary(candidate) }}</small></div><p v-if="!queryCandidates.length">本次没有可展示的候选车次。</p></div></article>
+        <article v-for="task in tasks" :key="task.id" class="task-card module"><div class="task-row"><div><small>优先级 {{ task.priority }} · {{ task.passengerCount }} 人 · {{ task.routeGroupCount }} 路线<span v-if="task.deadline"> · 截止 {{ new Date(task.deadline).toLocaleString() }}</span></small><h3>{{ task.name }}</h3><p v-if="task.failureReason" class="failure">{{ displayFailureReason(task.failureReason) }}</p></div><div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div></div><div v-if="queryTaskId === task.id" class="query-results"><div class="query-result-head"><strong>{{ queryMessage }}</strong><span>数据来自当前 12306 官方只读查询</span></div><div v-for="candidate in queryCandidates.slice(0, 20)" :key="candidate.trainInternalRef" class="train-row"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }} → {{ candidate.arrivalTime }}</span><span>{{ candidate.duration }}</span><small>{{ seatSummary(candidate) }}</small></div><p v-if="!queryCandidates.length">本次没有可展示的候选车次。</p></div></article>
       </section>
 
       <section v-else-if="isAuthenticated && activeView === 'create'" class="view create-view">
@@ -601,7 +594,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
       <section v-else-if="isAuthenticated && activeView === 'system'" class="view system-view">
         <div class="view-heading"><div><p class="kicker">安全与兼容</p><h1>系统与协议</h1><p>只有当前官网协议通过只读观测和人工评审，真实提交才会启用。</p></div></div>
         <section class="module system-detail"><div class="protocol-state-line"><span class="status-dot" :class="protocol?.status"></span><div><small>当前状态</small><h2>{{ statusLabel }}</h2></div></div><dl><div><dt>协议配置</dt><dd>{{ protocol?.profileId ?? "尚未建立" }}</dd></div><div><dt>最近验证</dt><dd>{{ protocol?.verifiedAt ?? "从未验证" }}</dd></div><div><dt>官方时钟校准</dt><dd>{{ officialClockOffsetMs == null ? "预检时校准" : `${officialClockOffsetMs >= 0 ? "+" : ""}${officialClockOffsetMs} ms` }}</dd></div><div><dt>真实提交</dt><dd>{{ protocol?.submissionEnabled ? "已启用" : "已锁定" }}</dd></div></dl><p class="system-message">{{ protocol?.message }}</p></section>
-        <section class="module boundaries"><h2>当前安全边界</h2><div><span>自动支付</span><strong>关闭</strong></div><div><span>候补订单</span><strong>首版不支持</strong></div><div><span>安全核验</span><strong>必须人工完成</strong></div><div><span>未知响应</span><strong>停止并核对订单</strong></div><div><span>本机通知自检</span><strong>{{ notificationSelfTestPassed ? "已确认" : "未完成" }}</strong></div><button class="quiet-action" @click="runNotificationSelfTest">运行本机通知自检</button><button class="quiet-action" @click="runStrongAlertTest">测试持续强提醒</button></section>
+        <section class="module boundaries"><h2>当前安全边界</h2><div><span>自动支付</span><strong>关闭</strong></div><div><span>候补订单</span><strong>首版不支持</strong></div><div><span>安全核验</span><strong>必须人工完成</strong></div><div><span>未知响应</span><strong>停止并核对订单</strong></div><div><span>系统通知（可选）</span><strong>{{ notificationSelfTestPassed ? "已测试" : "未测试" }}</strong></div><button class="quiet-action" @click="runNotificationSelfTest">测试系统通知（可选）</button><button class="quiet-action" @click="runStrongAlertTest">测试页面持续强提醒</button></section>
       </section>
     </main>
   </div>
