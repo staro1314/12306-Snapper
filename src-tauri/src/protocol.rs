@@ -24,12 +24,14 @@ pub struct ObservedReadOnlyProtocolAdapter;
 
 impl RailwayProtocolAdapter for ObservedReadOnlyProtocolAdapter {
     fn compatibility_status(&self) -> ProtocolStatusView {
-        let submission_enabled = std::env::var("FAST_12306_ENABLE_REAL_SUBMISSION").as_deref() == Ok("1");
+        // The current profile has completed a real pending-order acceptance run. Keep an
+        // environment-level emergency kill switch, while task-level consent remains mandatory.
+        let submission_enabled = std::env::var("FAST_12306_ENABLE_REAL_SUBMISSION").as_deref() != Ok("0");
         ProtocolStatusView {
             profile_id: Some("web-2026-09-17-order-v2".into()),
             status: if submission_enabled { CompatibilityStatus::Compatible } else { CompatibilityStatus::ReadOnlyCompatible },
             verified_at: Utc.with_ymd_and_hms(2026, 9, 17, 10, 50, 0).single(),
-            message: if submission_enabled { "当前协议配置已进入用户授权的真实提交测试模式。" } else { "当前官网登录、余票查询、订单初始化、确认排队和待支付查单链路已验证；真实提交门禁保持锁定。" }.into(),
+            message: if submission_enabled { "当前协议配置允许真实提交；每个任务仍必须明确授权，系统不会自动支付。" } else { "真实提交已被环境紧急开关关闭，任务仅执行查询。" }.into(),
             query_enabled: true,
             submission_enabled,
         }

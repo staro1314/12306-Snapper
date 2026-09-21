@@ -49,6 +49,7 @@ impl AppState {
     }
 
     pub fn create_task(&self, input: CreateTaskInput) -> Result<TicketTaskView, String> {
+        let real_submission_authorized = input.real_submission_authorized;
         let task = TicketTask::new(
             input.name,
             input.priority,
@@ -57,6 +58,8 @@ impl AppState {
             input.route_groups,
             input.deadline,
         )?;
+        let mut task = task;
+        task.real_submission_authorized = real_submission_authorized;
         self.repository.lock().save(&task)?;
         let view = TicketTaskView::from(&task);
         self.tasks.write().push(task);

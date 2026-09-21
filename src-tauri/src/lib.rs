@@ -267,8 +267,8 @@ mod tests {
         let second_id;
         {
             let state = AppState::open(database_path.clone()).unwrap();
-            first_id = state.create_task(CreateTaskInput { name: "first".into(), priority: 1, split_authorized: false, passengers: vec![passenger("shared", 1)], route_groups: vec![route()], deadline: None }).unwrap().id;
-            second_id = state.create_task(CreateTaskInput { name: "second".into(), priority: 2, split_authorized: false, passengers: vec![passenger("shared", 1)], route_groups: vec![route()], deadline: None }).unwrap().id;
+            first_id = state.create_task(CreateTaskInput { name: "first".into(), priority: 1, split_authorized: false, real_submission_authorized: false, passengers: vec![passenger("shared", 1)], route_groups: vec![route()], deadline: None }).unwrap().id;
+            second_id = state.create_task(CreateTaskInput { name: "second".into(), priority: 2, split_authorized: false, real_submission_authorized: false, passengers: vec![passenger("shared", 1)], route_groups: vec![route()], deadline: None }).unwrap().id;
             state.run_preflight(&first_id).unwrap();
             state.run_preflight(&second_id).unwrap();
             state.arm_task(&first_id).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         {
             let state = AppState::open(database_path.clone()).unwrap();
             task_id = state.create_task(CreateTaskInput {
-                name: "recovery".into(), priority: 1, split_authorized: false,
+                name: "recovery".into(), priority: 1, split_authorized: false, real_submission_authorized: false,
                 passengers: vec![passenger("p1", 1)],
                 route_groups: vec![RouteGroup { id: "r1".into(), travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), from_station: "北京南".into(), to_station: "上海虹桥".into(), sale_time: Utc::now() - Duration::seconds(1), priority: 1, train_codes: vec!["G1".into()], seat_types: vec!["二等座".into()] }],
                 deadline: None,
@@ -315,7 +315,7 @@ mod tests {
         let database_path = std::env::temp_dir().join(format!("fast-12306-partial-{}.db", uuid::Uuid::new_v4()));
         let state = AppState::open(database_path.clone()).unwrap();
         let task_id = state.create_task(CreateTaskInput {
-            name: "partial".into(), priority: 1, split_authorized: true,
+            name: "partial".into(), priority: 1, split_authorized: true, real_submission_authorized: false,
             passengers: vec![passenger("p1", 1), passenger("p2", 2)], deadline: None,
             route_groups: vec![RouteGroup { id: "r1".into(), travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), from_station: "北京南".into(), to_station: "上海虹桥".into(), sale_time: Utc::now() - Duration::seconds(1), priority: 1, train_codes: vec!["G1".into()], seat_types: vec!["二等座".into()] }],
         }).unwrap().id;
@@ -332,7 +332,7 @@ mod tests {
         let database_path = std::env::temp_dir().join(format!("fast-12306-expiry-{}.db", uuid::Uuid::new_v4()));
         let state = AppState::open(database_path.clone()).unwrap();
         let task_id = state.create_task(CreateTaskInput {
-            name: "expired".into(), priority: 1, split_authorized: false, passengers: vec![passenger("p1", 1)],
+            name: "expired".into(), priority: 1, split_authorized: false, real_submission_authorized: false, passengers: vec![passenger("p1", 1)],
             route_groups: vec![RouteGroup { id: "r1".into(), travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), from_station: "北京南".into(), to_station: "上海虹桥".into(), sale_time: Utc::now() - Duration::minutes(2), priority: 1, train_codes: vec!["G1".into()], seat_types: vec!["二等座".into()] }],
             deadline: Some(Utc::now() - Duration::minutes(1)),
         }).unwrap().id;
@@ -357,11 +357,11 @@ mod tests {
             seat_types: vec!["二等座".into()],
         };
         let inflight_id = state.create_task(CreateTaskInput {
-            name: "inflight".into(), priority: 1, split_authorized: false,
+            name: "inflight".into(), priority: 1, split_authorized: false, real_submission_authorized: false,
             passengers: vec![passenger("p1", 1)], route_groups: vec![route("r1")], deadline: None,
         }).unwrap().id;
         let armed_id = state.create_task(CreateTaskInput {
-            name: "armed".into(), priority: 2, split_authorized: false,
+            name: "armed".into(), priority: 2, split_authorized: false, real_submission_authorized: false,
             passengers: vec![passenger("p2", 1)], route_groups: vec![route("r2")], deadline: None,
         }).unwrap().id;
         for task_id in [&inflight_id, &armed_id] {
@@ -387,7 +387,7 @@ mod tests {
         let database_path = std::env::temp_dir().join(format!("fast-12306-delete-{}.db", uuid::Uuid::new_v4()));
         let state = AppState::open(database_path.clone()).unwrap();
         let create = |name: &str, passenger_ref: &str| CreateTaskInput {
-            name: name.into(), priority: 1, split_authorized: false,
+            name: name.into(), priority: 1, split_authorized: false, real_submission_authorized: false,
             passengers: vec![passenger(passenger_ref, 1)], deadline: None,
             route_groups: vec![RouteGroup {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -417,6 +417,35 @@ mod tests {
         state.delete_task(&order_id).unwrap();
         assert_eq!(state.list_order_snapshots().unwrap().len(), 1);
         drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn real_submission_authorization_is_explicit_and_persisted() {
+        let database_path = std::env::temp_dir().join(format!("fast-12306-real-consent-{}.db", uuid::Uuid::new_v4()));
+        let task_id;
+        {
+            let state = AppState::open(database_path.clone()).unwrap();
+            let view = state.create_task(CreateTaskInput {
+                name: "authorized".into(), priority: 1, split_authorized: false,
+                real_submission_authorized: true,
+                passengers: vec![passenger("p-authorized", 1)],
+                route_groups: vec![RouteGroup {
+                    id: "authorized-route".into(),
+                    travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                    from_station: "北京南".into(), to_station: "上海虹桥".into(),
+                    sale_time: Utc::now() + Duration::minutes(10), priority: 1,
+                    train_codes: vec!["G1".into()], seat_types: vec!["二等座".into()],
+                }],
+                deadline: None,
+            }).unwrap();
+            task_id = view.id.clone();
+            assert!(view.real_submission_authorized);
+            assert!(state.get_task(&task_id).unwrap().real_submission_authorized);
+        }
+        let restored = AppState::open(database_path.clone()).unwrap();
+        assert!(restored.get_task(&task_id).unwrap().real_submission_authorized);
+        drop(restored);
         let _ = std::fs::remove_file(database_path);
     }
 }

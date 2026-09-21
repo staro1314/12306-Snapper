@@ -39,6 +39,7 @@ export interface CreateTaskInput {
   name: string;
   priority: number;
   splitAuthorized: boolean;
+  realSubmissionAuthorized: boolean;
   passengers: PassengerSelection[];
   routeGroups: RouteGroupInput[];
   deadline: string | null;
@@ -50,6 +51,7 @@ export interface TicketTaskView {
   priority: number;
   status: string;
   splitAuthorized: boolean;
+  realSubmissionAuthorized: boolean;
   passengerCount: number;
   routeGroupCount: number;
   createdAt: string;

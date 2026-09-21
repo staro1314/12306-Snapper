@@ -114,6 +114,10 @@ pub struct TicketTask {
     pub priority: u16,
     pub status: TaskStatus,
     pub split_authorized: bool,
+    /// Whether this task explicitly authorizes creating a real 12306 pending-payment order.
+    /// False keeps the task query-only even when the process-level submission gate is enabled.
+    #[serde(default)]
+    pub real_submission_authorized: bool,
     pub passengers: Vec<PassengerSelection>,
     pub route_groups: Vec<RouteGroup>,
     pub created_at: DateTime<Utc>,
@@ -171,6 +175,7 @@ impl TicketTask {
             priority,
             status: TaskStatus::Draft,
             split_authorized,
+            real_submission_authorized: false,
             passengers,
             route_groups,
             created_at: Utc::now(),
@@ -203,6 +208,9 @@ pub struct CreateTaskInput {
     pub name: String,
     pub priority: u16,
     pub split_authorized: bool,
+    /// Explicit per-task consent for real order submission; omitted legacy payloads default to false.
+    #[serde(default)]
+    pub real_submission_authorized: bool,
     pub passengers: Vec<PassengerSelection>,
     pub route_groups: Vec<RouteGroup>,
     pub deadline: Option<DateTime<Utc>>,
@@ -228,6 +236,7 @@ impl TicketTask {
         ) {
             return Err("只有草稿、不兼容或失败任务可以编辑".into());
         }
+        let real_submission_authorized = input.real_submission_authorized;
         let replacement = TicketTask::new(
             input.name,
             input.priority,
@@ -239,6 +248,7 @@ impl TicketTask {
         self.name = replacement.name;
         self.priority = replacement.priority;
         self.split_authorized = replacement.split_authorized;
+        self.real_submission_authorized = real_submission_authorized;
         self.passengers = replacement.passengers;
         self.route_groups = replacement.route_groups;
         self.status = TaskStatus::Draft;
@@ -256,6 +266,7 @@ pub struct TicketTaskView {
     pub priority: u16,
     pub status: TaskStatus,
     pub split_authorized: bool,
+    pub real_submission_authorized: bool,
     pub passenger_count: usize,
     pub route_group_count: usize,
     pub created_at: DateTime<Utc>,
@@ -271,6 +282,7 @@ impl From<&TicketTask> for TicketTaskView {
             priority: task.priority,
             status: task.status,
             split_authorized: task.split_authorized,
+            real_submission_authorized: task.real_submission_authorized,
             passenger_count: task.passengers.len(),
             route_group_count: task.route_groups.len(),
             created_at: task.created_at,

@@ -9,7 +9,10 @@ const port = 3211;
 const profileDir = path.resolve(".browser-session/profile");
 const statusFile = path.resolve(".browser-session/status.json");
 const loginUrl = "https://kyfw.12306.cn/otn/resources/login.html";
-const realSubmissionEnabled = process.env.FAST_12306_ENABLE_REAL_SUBMISSION === "1";
+// The observed protocol profile has completed a real pending-order acceptance run.
+// Real submission is therefore available by default, but every task still needs explicit
+// per-task authorization. Set the environment variable to 0 as an emergency kill switch.
+const realSubmissionEnabled = process.env.FAST_12306_ENABLE_REAL_SUBMISSION !== "0";
 let context;
 let page;
 let polling;

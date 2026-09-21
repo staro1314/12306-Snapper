@@ -46,7 +46,7 @@ const officialClockOffsetMs = ref<number | null>(null);
 let alertSoundTimer: number | undefined;
 let alertTitleTimer: number | undefined;
 const paymentAlert = ref<{ trainCode: string; partial: boolean; confirmedAt: string; test?: boolean } | null>(null);
-const form = reactive({ name: "", priority: 1, travelDate: "", fromStation: "", toStation: "", saleTime: "", deadline: "", trainCodes: "", seatTypes: "二等座", passengerRef: "", passengerName: "", splitAuthorized: false });
+const form = reactive({ name: "", priority: 1, travelDate: "", fromStation: "", toStation: "", saleTime: "", deadline: "", trainCodes: "", seatTypes: "二等座", passengerRef: "", passengerName: "", splitAuthorized: false, realSubmissionAuthorized: false });
 type RouteDraft = { id: string; travelDate: string; fromStation: string; toStation: string; saleTime: string; priority: number; trainCodes: string; seatTypes: string };
 const selectedPassengerRefs = ref<string[]>([]);
 const additionalRoutes = ref<RouteDraft[]>([]);
@@ -199,7 +199,7 @@ async function submitTask() {
       if (!route.trainCodes || !route.seatTypes) throw new Error("请为每条路线选择车次和席别");
     }
   const input: CreateTaskInput = {
-    name: form.name.trim(), priority: Number(form.priority), splitAuthorized: form.splitAuthorized,
+    name: form.name.trim(), priority: Number(form.priority), splitAuthorized: form.splitAuthorized, realSubmissionAuthorized: form.realSubmissionAuthorized,
     passengers: selectedPassengerRefs.value.map((passengerRef, index) => { const passenger = passengerOptions.value.find((item) => item.passengerRef === passengerRef)!; return { passengerRef, displayName: passenger.displayName, ticketType: passenger.ticketType, priority: index + 1, verified: passenger.verified }; }),
     routeGroups: [{ id: editingTask.value?.routeGroups[0]?.id ?? crypto.randomUUID(), travelDate: form.travelDate, fromStation: form.fromStation.trim(), toStation: form.toStation.trim(), saleTime: new Date(form.saleTime).toISOString(), priority: editingTask.value?.routeGroups[0]?.priority ?? 1, trainCodes: form.trainCodes.split(/[,，\s]+/).filter(Boolean), seatTypes: form.seatTypes.split(/[,，\s]+/).filter(Boolean) }, ...additionalRoutes.value.map((route) => ({ id: route.id, travelDate: route.travelDate, fromStation: route.fromStation.trim(), toStation: route.toStation.trim(), saleTime: new Date(route.saleTime).toISOString(), priority: route.priority, trainCodes: route.trainCodes.split(/[,，\s]+/).filter(Boolean), seatTypes: route.seatTypes.split(/[,，\s]+/).filter(Boolean) }))],
     deadline: form.deadline ? new Date(form.deadline).toISOString() : null,
@@ -219,10 +219,10 @@ async function submitTask() {
   catch (cause) { error.value = String(cause); }
   finally { busy.value = false; }
 }
-function resetForm() { editingTaskId.value = ""; editingTask.value = null; selectedPassengerRefs.value = []; additionalRoutes.value = []; formQueryCandidates.value = []; formQueryMessage.value = ""; for (const key of Object.keys(routeQueryCandidates)) delete routeQueryCandidates[key]; Object.assign(form, { name: "", priority: 1, travelDate: "", fromStation: "", toStation: "", saleTime: "", deadline: "", trainCodes: "", seatTypes: "二等座", passengerRef: "", passengerName: "", splitAuthorized: false }); }
+function resetForm() { editingTaskId.value = ""; editingTask.value = null; selectedPassengerRefs.value = []; additionalRoutes.value = []; formQueryCandidates.value = []; formQueryMessage.value = ""; for (const key of Object.keys(routeQueryCandidates)) delete routeQueryCandidates[key]; Object.assign(form, { name: "", priority: 1, travelDate: "", fromStation: "", toStation: "", saleTime: "", deadline: "", trainCodes: "", seatTypes: "二等座", passengerRef: "", passengerName: "", splitAuthorized: false, realSubmissionAuthorized: false }); }
 async function editTask(taskId: string) {
   busy.value = true; error.value = "";
-  try { const task = await getTask(taskId); const route = task.routeGroups[0]; editingTaskId.value = task.id; editingTask.value = task; selectedPassengerRefs.value = task.passengers.sort((a,b) => a.priority - b.priority).map((passenger) => passenger.passengerRef); additionalRoutes.value = task.routeGroups.slice(1).map((item) => ({ id: item.id, travelDate: item.travelDate, fromStation: item.fromStation, toStation: item.toStation, saleTime: localDateTime(item.saleTime), priority: item.priority, trainCodes: item.trainCodes.join(", "), seatTypes: item.seatTypes.join(", ") })); Object.assign(form, { name: task.name, priority: task.priority, travelDate: route.travelDate, fromStation: route.fromStation, toStation: route.toStation, saleTime: localDateTime(route.saleTime), deadline: task.deadline ? localDateTime(task.deadline) : "", trainCodes: route.trainCodes.join(", "), seatTypes: route.seatTypes.join(", "), splitAuthorized: task.splitAuthorized }); activeView.value = "create"; }
+  try { const task = await getTask(taskId); const route = task.routeGroups[0]; editingTaskId.value = task.id; editingTask.value = task; selectedPassengerRefs.value = task.passengers.sort((a,b) => a.priority - b.priority).map((passenger) => passenger.passengerRef); additionalRoutes.value = task.routeGroups.slice(1).map((item) => ({ id: item.id, travelDate: item.travelDate, fromStation: item.fromStation, toStation: item.toStation, saleTime: localDateTime(item.saleTime), priority: item.priority, trainCodes: item.trainCodes.join(", "), seatTypes: item.seatTypes.join(", ") })); Object.assign(form, { name: task.name, priority: task.priority, travelDate: route.travelDate, fromStation: route.fromStation, toStation: route.toStation, saleTime: localDateTime(route.saleTime), deadline: task.deadline ? localDateTime(task.deadline) : "", trainCodes: route.trainCodes.join(", "), seatTypes: route.seatTypes.join(", "), splitAuthorized: task.splitAuthorized, realSubmissionAuthorized: task.realSubmissionAuthorized }); activeView.value = "create"; }
   catch (cause) { error.value = String(cause); } finally { busy.value = false; }
 }
 
@@ -344,12 +344,13 @@ async function reconcileUnknownAttempt(task: TicketTaskDetail, attemptedRefs: st
 }
 async function executeSelectedCandidate(route: ScheduledRoute, selected: TicketQueryCandidate) {
   if (orderExecutionBusy.value) return;
-  if (!protocol.value?.submissionEnabled || !browserCapabilities.value?.realSubmissionEnabled) { schedulerMessage.value = `已命中 ${selected.trainCode}，真实提交门禁仍锁定`; return; }
+  const task = await getTask(route.taskId);
+  if (!task.realSubmissionAuthorized) { schedulerMessage.value = `已命中 ${selected.trainCode}，该任务未授权真实提交`; return; }
+  if (!protocol.value?.submissionEnabled || !browserCapabilities.value?.realSubmissionEnabled) { schedulerMessage.value = `已命中 ${selected.trainCode}，真实提交环境门禁仍锁定`; return; }
   orderExecutionBusy.value = true;
   let successfulSegments = 0;
   let activePassengerRefs: string[] = [];
   try {
-    const task = await getTask(route.taskId);
     const seat = selectPreferredSeat(selected, route.seatTypes);
     if (!seat) throw new Error("命中车次但没有可用的优先席别");
     const seatValue = selected.seats[seatKey[seat]] ?? "";
@@ -564,7 +565,7 @@ onBeforeUnmount(() => { if (schedulerTimer) window.clearTimeout(schedulerTimer);
             <button class="quiet-action add-route" type="button" :disabled="additionalRoutes.length >= 4" @click="addRoute">{{ additionalRoutes.length >= 4 ? "最多 5 个路线组" : "添加日期或路线组" }}</button>
           </section>
           <section class="form-section module"><div class="section-intro"><span>2</span><div><h2>乘车人</h2><p>可选择多人；勾选顺序即拆单优先级。本地只保存不可逆引用和掩码显示名。</p></div></div><div v-if="passengerOptions.length" class="passenger-grid"><label v-for="passenger in passengerOptions" :key="passenger.passengerRef" class="passenger-choice"><input v-model="selectedPassengerRefs" type="checkbox" :value="passenger.passengerRef" /><span><strong>{{ passenger.displayName }}</strong>{{ 'ticketTypeLabel' in passenger ? passenger.ticketTypeLabel : passenger.ticketType }}</span></label></div><div v-else class="passenger-empty"><span>尚未同步乘车人</span><button class="quiet-action" type="button" @click="activeView = 'login'">前往登录模块同步</button></div><p v-if="!selectedPassengerRefs.length" class="field-hint">至少选择一名已核验乘车人。</p></section>
-          <section class="form-section module"><div class="section-intro"><span>3</span><div><h2>提交策略</h2><p>拆单只在明确授权后执行，任何未知结果都会中止后续订单。</p></div></div><label class="consent"><input v-model="form.splitAuthorized" type="checkbox" /><span><strong>允许自动拆单</strong>余票不足时按乘车人优先级逐单提交。</span></label></section>
+          <section class="form-section module"><div class="section-intro"><span>3</span><div><h2>提交策略</h2><p>拆单只在明确授权后执行，任何未知结果都会中止后续订单。</p></div></div><label class="consent"><input v-model="form.splitAuthorized" type="checkbox" /><span><strong>允许自动拆单</strong>余票不足时按乘车人优先级逐单提交。</span></label><label class="consent real-submission-consent"><input v-model="form.realSubmissionAuthorized" type="checkbox" /><span><strong>允许真实自动下单</strong>命中车次后，系统可以向 12306 提交并生成待支付订单；不会自动支付，支付或取消由你在官方页面完成。</span></label><p class="field-hint">未勾选时只自动查票和选票，不会创建真实订单。</p></section>
           <div class="form-actions"><button class="quiet-action" type="button" @click="resetForm(); activeView = 'tasks'">取消</button><button :disabled="busy || !selectedPassengerRefs.length" type="submit">{{ busy ? "保存中…" : editingTaskId ? "保存修改" : "保存任务" }}</button></div>
         </form>
       </section>
