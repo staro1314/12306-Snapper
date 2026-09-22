@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BrowserCapabilities, BrowserSessionStatus, CreateTaskInput, ExecutionEvent, OfficialPassenger, OrderReconciliationResult, OrderSnapshot, ProtocolStatus, RealOrderResult, RehearsalResult, RehearsalScenario, ScheduledRoute, TicketQueryResult, TicketTaskDetail, TicketTaskView } from "./contracts";
+import type { BrowserCapabilities, BrowserLoginQr, BrowserSessionStatus, CreateTaskInput, ExecutionEvent, OfficialPassenger, OrderReconciliationResult, OrderSnapshot, ProtocolStatus, RealOrderResult, RehearsalResult, RehearsalScenario, ScheduledRoute, TicketQueryResult, TicketTaskDetail, TicketTaskView } from "./contracts";
 
 const inTauri = (): boolean => "__TAURI_INTERNALS__" in window;
 
@@ -15,6 +15,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function getProtocolStatus(): Promise<ProtocolStatus> {
   return inTauri() ? invoke("get_protocol_status") : request("/protocol");
+}
+export async function getRuntimeStatus(): Promise<{ owner: "RUST_BACKGROUND_RUNTIME"; heartbeatAt: string | null; healthy: boolean }> {
+  return request("/runtime/status");
 }
 
 export async function listTasks(): Promise<TicketTaskView[]> {
@@ -61,8 +64,10 @@ export async function deleteTask(taskId: string): Promise<void> {
 export async function runRehearsal(taskId: string, scenario: RehearsalScenario, availableCount?: number): Promise<RehearsalResult> {
   return inTauri() ? invoke("run_rehearsal", { taskId, input: { scenario, availableCount } }) : request(`/tasks/${encodeURIComponent(taskId)}/rehearsal`, { method: "POST", body: JSON.stringify({ scenario, availableCount }) });
 }
-export async function listEvents(taskId: string): Promise<ExecutionEvent[]> {
-  return inTauri() ? invoke("list_events", { taskId }) : request(`/tasks/${encodeURIComponent(taskId)}/events`);
+export async function listEvents(taskId: string, limit = 100): Promise<ExecutionEvent[]> {
+  return inTauri()
+    ? invoke("list_events", { taskId, limit })
+    : request(`/tasks/${encodeURIComponent(taskId)}/events?limit=${limit}`);
 }
 export async function recordRuntimeEvent(input: { taskId: string; routeGroupId?: string; stage: string; outcome: string; message: string; durationMs?: number }): Promise<ExecutionEvent> { return inTauri() ? invoke("record_execution_event", { input }) : request(`/tasks/${encodeURIComponent(input.taskId)}/events`, { method: "POST", body: JSON.stringify(input) }); }
 
@@ -73,11 +78,17 @@ export async function getBrowserSession(): Promise<BrowserSessionStatus> {
   return payload as BrowserSessionStatus;
 }
 
-export async function startBrowserSession(): Promise<BrowserSessionStatus> {
-  const response = await fetch("/browser/start", { method: "POST" });
+export async function startBrowserSession(visible = true): Promise<BrowserSessionStatus> {
+  const response = await fetch("/browser/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visible }) });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error ?? "无法启动 12306 登录浏览器");
   return payload as BrowserSessionStatus;
+}
+export async function getBrowserLoginQr(): Promise<BrowserLoginQr> {
+  const response = await fetch("/browser/login/qr");
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error ?? "无法读取 12306 登录二维码");
+  return payload as BrowserLoginQr;
 }
 export async function logoutBrowserSession(): Promise<BrowserSessionStatus> {
   const response = await fetch("/browser/logout", { method: "POST" });

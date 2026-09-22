@@ -97,10 +97,10 @@ impl TaskRepository {
         Ok(())
     }
 
-    pub fn list_events(&self, task_id: &str) -> Result<Vec<ExecutionEvent>, String> {
-        let mut statement = self.connection.prepare("SELECT payload_json FROM execution_event WHERE task_id=?1 ORDER BY created_at DESC").map_err(|error| error.to_string())?;
+    pub fn list_events(&self, task_id: &str, limit: usize) -> Result<Vec<ExecutionEvent>, String> {
+        let mut statement = self.connection.prepare("SELECT payload_json FROM execution_event WHERE task_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2").map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([task_id], |row| row.get::<_, String>(0))
+            .query_map(params![task_id, limit], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
         rows.map(|row| {
             serde_json::from_str(&row.map_err(|error| error.to_string())?)

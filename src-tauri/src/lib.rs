@@ -1,6 +1,7 @@
 mod app;
 mod domain;
 mod protocol;
+mod runtime;
 mod storage;
 pub mod web;
 
@@ -103,8 +104,9 @@ fn run_rehearsal(
 fn list_events(
     state: tauri::State<'_, AppState>,
     task_id: String,
+    limit: Option<usize>,
 ) -> Result<Vec<ExecutionEvent>, String> {
-    state.list_events(&task_id)
+    state.list_events(&task_id, limit)
 }
 #[tauri::command]
 fn record_execution_event(state: tauri::State<'_, AppState>, input: RecordExecutionEventInput) -> Result<ExecutionEvent, String> { state.record_execution_event(input) }
@@ -155,8 +157,9 @@ mod tests {
     use chrono::{Duration, NaiveDate, Utc};
 
     use crate::domain::{
-        CreateTaskInput, HaltTaskInput, OfficialOrderStatus, PassengerSelection, RecordOrderResultInput,
-        RouteGroup, TaskStatus, TicketCandidate, TicketTask, select_candidate, select_query_batch,
+        CreateTaskInput, HaltTaskInput, OfficialOrderStatus, PassengerSelection, RecordExecutionEventInput,
+        RecordOrderResultInput, RouteGroup, TaskStatus, TicketCandidate, TicketTask, select_candidate,
+        select_query_batch,
     };
     use crate::AppState;
 
@@ -284,6 +287,38 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Draft);
         assert_eq!(task.failure_reason, None);
         let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn execution_log_query_returns_newest_events_with_a_bounded_limit() {
+        let path = std::env::temp_dir().join(format!("fast-12306-event-limit-{}.db", uuid::Uuid::new_v4()));
+        let state = AppState::open(path.clone()).unwrap();
+        let task = state.create_task(CreateTaskInput {
+            name: "日志测试".into(), priority: 1, split_authorized: false,
+            real_submission_authorized: false, passengers: vec![passenger("p1", 1)],
+            route_groups: vec![RouteGroup {
+                id: "r1".into(),
+                travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                from_station: "北京南".into(),
+                to_station: "上海虹桥".into(),
+                sale_time: Utc::now() + Duration::hours(1),
+                priority: 1,
+                train_codes: vec!["G1".into()],
+                seat_types: vec!["二等座".into()],
+            }], deadline: None,
+        }).unwrap();
+        for message in ["第一条", "第二条", "第三条"] {
+            state.record_execution_event(RecordExecutionEventInput {
+                task_id: task.id.clone(), route_group_id: None, stage: "TASK_START".into(),
+                outcome: "STARTED".into(), message: message.into(), duration_ms: None,
+            }).unwrap();
+        }
+        let events = state.list_events(&task.id, Some(2)).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message, "第三条");
+        assert_eq!(events[1].message, "第二条");
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     AppState,
+    runtime::AutomationRuntime,
     domain::{
         CreateTaskInput, ExecutionEvent, HaltTaskInput, OrderSnapshot, ProtocolStatusView, RecordExecutionEventInput, RecordOrderResultInput,
         RehearsalResult, RunRehearsalInput, ScheduledRoute, TicketTask, TicketTaskView,
@@ -35,6 +36,9 @@ struct SafetyPauseInput { reason: String }
 #[serde(rename_all = "camelCase")]
 struct PreviewQuery { now: Option<chrono::DateTime<chrono::Utc>> }
 
+#[derive(Debug, Deserialize)]
+struct EventQuery { limit: Option<usize> }
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -51,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/protocol", get(protocol_status))
+        .route("/api/runtime/status", get(runtime_status))
         .route("/api/scheduler/preview", get(preview_query_batch))
         .route("/api/safety/pause", post(pause_all_automation))
         .route(
@@ -133,13 +138,16 @@ async fn run_rehearsal(
 async fn list_events(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
+    Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<ExecutionEvent>>, ApiError> {
-    state.list_events(&task_id).map(Json).map_err(ApiError)
+    state.list_events(&task_id, query.limit).map(Json).map_err(ApiError)
 }
 async fn record_execution_event(State(state): State<Arc<AppState>>, Path(task_id): Path<String>, Json(mut input): Json<RecordExecutionEventInput>) -> Result<Json<ExecutionEvent>, ApiError> { input.task_id = task_id; state.record_execution_event(input).map(Json).map_err(ApiError) }
 
 pub async fn serve(database_path: PathBuf) -> Result<(), String> {
     let state = Arc::new(AppState::open(database_path)?);
+    let runtime = Arc::new(AutomationRuntime::new(state.clone())?);
+    tokio::spawn(runtime.run());
     let address: SocketAddr = WEB_SERVER_ADDRESS
         .parse()
         .map_err(|error| format!("本地服务地址无效: {error}"))?;
@@ -155,6 +163,14 @@ pub async fn serve(database_path: PathBuf) -> Result<(), String> {
 
 async fn protocol_status(State(state): State<Arc<AppState>>) -> Json<ProtocolStatusView> {
     Json(state.protocol_status())
+}
+
+async fn runtime_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "owner": "RUST_BACKGROUND_RUNTIME",
+        "heartbeatAt": state.runtime_heartbeat(),
+        "healthy": state.runtime_heartbeat().is_some_and(|at| (chrono::Utc::now() - at).num_seconds() < 5),
+    }))
 }
 
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TicketTaskView>> {

@@ -15,6 +15,10 @@ export interface BrowserSessionStatus {
   updatedAt: string;
 }
 
+export interface BrowserLoginQr extends BrowserSessionStatus {
+  qrDataUrl: string | null;
+}
+
 export interface PassengerSelection {
   passengerRef: string;
   displayName: string;
@@ -54,6 +58,7 @@ export interface TicketTaskView {
   realSubmissionAuthorized: boolean;
   passengerCount: number;
   routeGroupCount: number;
+  nextSaleTime: string | null;
   createdAt: string;
   failureReason: string | null;
   deadline: string | null;
@@ -74,4 +79,4 @@ export interface OrderSnapshot { localId: string; taskId: string; officialOrderR
 export interface OrderReconciliationResult { source: "12306_OFFICIAL"; classification: "EMPTY" | "PAYMENT_PENDING" | "UNKNOWN_STRUCTURE"; orders?: Array<{ orderRef: string; status: "PAYMENT_PENDING"; passengerRefs: string[]; paymentDeadline: string | null }>; dataKeys?: string[]; }
 export interface ScheduledRoute { taskId: string; routeGroupId: string; taskPriority: number; routePriority: number; saleTime: string; travelDate: string; fromStation: string; toStation: string; trainCodes: string[]; seatTypes: string[]; }
 export interface BrowserCapabilities { queryEnabled: boolean; realSubmissionEnabled: boolean; }
-export interface RealOrderResult { source: "12306_OFFICIAL"; status: "PAYMENT_PENDING" | "QUEUING"; orderRef: string | null; waitTime: number | null; }
+export interface RealOrderResult { source: "12306_OFFICIAL"; status: "PAYMENT_PENDING" | "QUEUING"; orderRef: string | null; waitTime: number | null; confirmPath?: string; }

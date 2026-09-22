@@ -20,6 +20,7 @@ pub struct AppState {
     tasks: RwLock<Vec<TicketTask>>,
     protocol: Arc<dyn RailwayProtocolAdapter>,
     pub submission_lock: Mutex<()>,
+    runtime_heartbeat: RwLock<Option<chrono::DateTime<Utc>>>,
 }
 
 impl AppState {
@@ -52,7 +53,16 @@ impl AppState {
             tasks: RwLock::new(tasks),
             protocol: Arc::new(ObservedReadOnlyProtocolAdapter),
             submission_lock: Mutex::new(()),
+            runtime_heartbeat: RwLock::new(None),
         })
+    }
+
+    pub fn mark_runtime_heartbeat(&self, at: chrono::DateTime<Utc>) {
+        *self.runtime_heartbeat.write() = Some(at);
+    }
+
+    pub fn runtime_heartbeat(&self) -> Option<chrono::DateTime<Utc>> {
+        *self.runtime_heartbeat.read()
     }
 
     pub fn protocol_status(&self) -> ProtocolStatusView {
@@ -88,6 +98,10 @@ impl AppState {
             .find(|task| task.id == task_id)
             .cloned()
             .ok_or_else(|| "任务不存在".into())
+    }
+
+    pub(crate) fn task_snapshot(&self) -> Vec<TicketTask> {
+        self.tasks.read().clone()
     }
 
     pub fn preview_query_batch(&self) -> Result<Vec<ScheduledRoute>, String> {
@@ -141,8 +155,8 @@ impl AppState {
         Ok(())
     }
 
-    pub fn list_events(&self, task_id: &str) -> Result<Vec<ExecutionEvent>, String> {
-        self.repository.lock().list_events(task_id)
+    pub fn list_events(&self, task_id: &str, limit: Option<usize>) -> Result<Vec<ExecutionEvent>, String> {
+        self.repository.lock().list_events(task_id, limit.unwrap_or(100).clamp(1, 500))
     }
 
     pub fn record_execution_event(&self, input: RecordExecutionEventInput) -> Result<ExecutionEvent, String> {
@@ -305,6 +319,14 @@ impl AppState {
         let mut tasks = self.tasks.write();
         let task = tasks.iter_mut().find(|task| task.id == task_id).ok_or("任务不存在")?;
         task.transition(TaskStatus::OrderSubmitting)?;
+        self.repository.lock().save(task)?;
+        Ok(TicketTaskView::from(&*task))
+    }
+
+    pub fn mark_order_queuing(&self, task_id: &str) -> Result<TicketTaskView, String> {
+        let mut tasks = self.tasks.write();
+        let task = tasks.iter_mut().find(|task| task.id == task_id).ok_or("任务不存在")?;
+        task.transition(TaskStatus::Queuing)?;
         self.repository.lock().save(task)?;
         Ok(TicketTaskView::from(&*task))
     }

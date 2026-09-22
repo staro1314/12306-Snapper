@@ -269,6 +269,9 @@ pub struct TicketTaskView {
     pub real_submission_authorized: bool,
     pub passenger_count: usize,
     pub route_group_count: usize,
+    /// Earliest official sale time among this task's route groups. The client uses this
+    /// server-owned value for the armed-task countdown instead of reconstructing task detail.
+    pub next_sale_time: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub failure_reason: Option<String>,
     pub deadline: Option<DateTime<Utc>>,
@@ -285,6 +288,7 @@ impl From<&TicketTask> for TicketTaskView {
             real_submission_authorized: task.real_submission_authorized,
             passenger_count: task.passengers.len(),
             route_group_count: task.route_groups.len(),
+            next_sale_time: task.route_groups.iter().map(|route| route.sale_time).min(),
             created_at: task.created_at,
             failure_reason: task.failure_reason.clone(),
             deadline: task.deadline,

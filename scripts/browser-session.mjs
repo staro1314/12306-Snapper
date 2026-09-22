@@ -9,6 +9,9 @@ const port = 3211;
 const profileDir = path.resolve(".browser-session/profile");
 const statusFile = path.resolve(".browser-session/status.json");
 const loginUrl = "https://kyfw.12306.cn/otn/resources/login.html";
+const ORDER_CONFIRM_REQUEST_TIMEOUT_MS = 30_000;
+const ORDER_QUEUE_TIMEOUT_MS = 5 * 60_000;
+const ORDER_QUEUE_RESPONSE_TIMEOUT_MS = 35_000;
 // The observed protocol profile has completed a real pending-order acceptance run.
 // Real submission is therefore available by default, but every task still needs explicit
 // per-task authorization. Set the environment variable to 0 as an emergency kill switch.
@@ -19,6 +22,11 @@ let polling;
 let browserHeadless = false;
 let suppressCloseRecovery = false;
 let recoveryTimer;
+// Closing the visible official window is not a logout. Remember that this
+// process has observed a valid official session so the same persistent profile
+// can be reopened headlessly even if the page is between two status checks at
+// the exact moment Chrome closes.
+let authenticatedSessionObserved = false;
 const observations = [];
 let passengerSnapshot = [];
 const passengerSecrets = new Map();
@@ -27,6 +35,7 @@ let latestQuery = null;
 let lastOfficialQueryStartedAt = 0;
 let securityState = null;
 let orderExecutionInProgress = false;
+let orderQueueState = { status: "IDLE", orderRef: null, waitTime: null, confirmPath: null, queueAcceptedAt: null, queueAcceptedDurationMs: null, updatedAt: new Date().toISOString() };
 let status = { state: "idle", message: "尚未打开 12306 官方登录页", updatedAt: new Date().toISOString() };
 
 const seatOptionLabel = (label) => ({
@@ -65,20 +74,80 @@ async function inspectLoginState() {
         const response = await fetch("/otn/login/conf", { method: "POST", credentials: "include" });
         const body = await response.json();
         const value = body?.data?.loginCheck ?? body?.data?.is_login ?? body?.data?.flag;
-        return { visibleLogout, value, nowStr: body?.data?.nowStr ?? null, nowValue: body?.data?.now ?? null, security: { isSweepLogin: body?.data?.is_sweep_login ?? null, isUamLogin: body?.data?.is_uam_login ?? null, isLoginPassCode: body?.data?.is_login_passCode ?? null, isMessagePassCode: body?.data?.is_message_passCode ?? null, isPhoneCheck: body?.data?.is_phone_check ?? null } };
-      } catch { return { visibleLogout, value: null }; }
+        return { visibleLogout, value, qrResultCode: typeof window.popup_s === "undefined" ? null : String(window.popup_s), nowStr: body?.data?.nowStr ?? null, nowValue: body?.data?.now ?? null, security: { isSweepLogin: body?.data?.is_sweep_login ?? null, isUamLogin: body?.data?.is_uam_login ?? null, isLoginPassCode: body?.data?.is_login_passCode ?? null, isMessagePassCode: body?.data?.is_message_passCode ?? null, isPhoneCheck: body?.data?.is_phone_check ?? null } };
+      } catch { return { visibleLogout, value: null, qrResultCode: typeof window.popup_s === "undefined" ? null : String(window.popup_s) }; }
     });
     const epochCandidate = Number(result.nowValue);
     officialClock = { nowStr: typeof result.nowStr === "string" ? result.nowStr : officialClock?.nowStr ?? null, epochMs: Number.isFinite(epochCandidate) && epochCandidate > 1_000_000_000_000 ? epochCandidate : null };
     securityState = result.security;
     if (result.visibleLogout || result.value === "Y" || result.value === true) {
+      authenticatedSessionObserved = true;
       await updateStatus("logged_in", "已确认当前 12306 官方会话登录成功");
+    } else if (result.qrResultCode === "1") {
+      await updateStatus("awaiting_login", "二维码已扫描，请在铁路 12306 App 中确认登录");
+    } else if (result.qrResultCode === "2") {
+      await updateStatus("starting", "App 已确认，正在完成 12306 官方会话认证");
+    } else if (result.qrResultCode === "3") {
+      await updateStatus("awaiting_login", "二维码已失效，请刷新后重新扫描");
+    } else if (result.qrResultCode === "5") {
+      await updateStatus("user_action_required", "12306 返回登录系统异常，请刷新二维码重试");
     } else {
-      await updateStatus("awaiting_login", "请在打开的 12306 官方窗口中扫码并完成必要核验");
+      await updateStatus("awaiting_login", "请扫描系统内的 12306 官方二维码");
     }
   } catch (error) {
     await updateStatus("user_action_required", `无法确认登录状态，请检查官方窗口：${error.message}`);
   }
+}
+
+async function captureLoginQrCode() {
+  if (!page || page.isClosed()) await startBrowser({ headless: true });
+  await inspectLoginState();
+  if (status.state === "logged_in") return { state: status.state, message: status.message, qrDataUrl: null };
+  if (new URL(page.url()).pathname !== new URL(loginUrl).pathname) {
+    await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
+  }
+  await page.evaluate(() => {
+    const jquery = window.jQuery;
+    if (jquery && typeof jquery.popup_createQr === "function") jquery.popup_createQr();
+  });
+  await page.waitForFunction(() => {
+    const image = document.querySelector("#J-qrImg");
+    return image instanceof HTMLImageElement && (image.currentSrc || image.src).startsWith("data:image/");
+  }, null, { timeout: 10000 });
+  const officialQrDataUrl = await page.locator("#J-qrImg").getAttribute("src");
+  if (officialQrDataUrl?.startsWith("data:image/")) {
+    return {
+      state: status.state,
+      message: "请使用铁路 12306 App 扫描二维码",
+      qrDataUrl: officialQrDataUrl,
+    };
+  }
+  const qrSelectors = ["#J-qrImg", ".qr-img img", "img[src*='qr']", ".qr-img", ".login-code img", "canvas"];
+  let qrTarget = null;
+  for (const selector of qrSelectors) {
+    const candidate = page.locator(selector).first();
+    if (await candidate.count() && await candidate.isVisible().catch(() => false)) {
+      qrTarget = candidate;
+      break;
+    }
+  }
+  if (!qrTarget) {
+    await page.waitForTimeout(1200);
+    for (const selector of qrSelectors) {
+      const candidate = page.locator(selector).first();
+      if (await candidate.count() && await candidate.isVisible().catch(() => false)) {
+        qrTarget = candidate;
+        break;
+      }
+    }
+  }
+  if (!qrTarget) throw new Error("12306 官方登录页未返回可识别的二维码");
+  const png = await qrTarget.screenshot({ type: "png" });
+  return {
+    state: status.state,
+    message: "请使用铁路 12306 App 扫描二维码",
+    qrDataUrl: `data:image/png;base64,${png.toString("base64")}`,
+  };
 }
 
 async function ensureSearchPage() {
@@ -99,6 +168,9 @@ function summarizeShape(value) {
 function parseTicketCandidate(row) {
   const fields = String(row).split("|");
   return {
+    // Kept only in this local sidecar process. It is required by the official
+    // submitOrderRequest call and is deliberately stripped from every API response/log.
+    secretStr: fields[0] ?? "",
     trainInternalRef: fields[2] ?? "",
     trainCode: fields[3] ?? "",
     fromStationCode: fields[6] ?? "",
@@ -120,6 +192,11 @@ function parseTicketCandidate(row) {
       other: fields[22] ?? "",
     },
   };
+}
+
+function publicTicketCandidate(candidate) {
+  const { secretStr: _secretStr, ...safe } = candidate;
+  return safe;
 }
 
 function attachReadOnlyObserver(targetPage) {
@@ -170,6 +247,13 @@ function attachReadOnlyObserver(targetPage) {
             };
           });
         }
+        if (url.pathname === "/passport/web/checkqr") {
+          const qrResultCode = String(body?.result_code ?? "");
+          if (qrResultCode === "1") await updateStatus("awaiting_login", "二维码已扫描，请在铁路 12306 App 中确认登录");
+          else if (qrResultCode === "2") await updateStatus("starting", "App 已确认，正在完成 12306 官方会话认证");
+          else if (qrResultCode === "3") await updateStatus("awaiting_login", "二维码已失效，请刷新后重新扫描");
+          else if (qrResultCode === "5") await updateStatus("user_action_required", "12306 返回登录系统异常，请刷新二维码重试");
+        }
       }
       observations.push(entry);
       if (observations.length > 300) observations.splice(0, observations.length - 300);
@@ -192,12 +276,18 @@ async function startBrowser({ headless = false } = {}) {
       return status;
     }
   }
-  await updateStatus("starting", headless ? "正在恢复后台 12306 会话" : "正在启动持久化 Chrome");
+  if (headless && authenticatedSessionObserved) {
+    await updateStatus("logged_in", "官方窗口已关闭，正在后台恢复并复核 12306 会话");
+  } else {
+    await updateStatus("starting", headless ? "正在恢复后台 12306 会话" : "正在启动持久化 Chrome");
+  }
   await mkdir(profileDir, { recursive: true });
   context = await chromium.launchPersistentContext(profileDir, {
     channel: "chrome",
     headless,
-    viewport: null,
+    // 12306 initializes the QR panel from layout dimensions. A headless
+    // context with the visible-window `null` viewport collapses it to 0x0.
+    viewport: headless ? { width: 1280, height: 900 } : null,
     args: headless ? [] : ["--start-maximized"],
   });
   browserHeadless = headless;
@@ -205,14 +295,18 @@ async function startBrowser({ headless = false } = {}) {
   for (const openPage of context.pages()) attachReadOnlyObserver(openPage);
   context.on("page", attachReadOnlyObserver);
   await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
-  await updateStatus(headless ? "starting" : "awaiting_login", headless ? "登录窗口已关闭，后台正在保持会话" : "请在打开的 12306 官方窗口中扫码并完成必要核验");
+  if (headless && authenticatedSessionObserved) {
+    await updateStatus("logged_in", "登录窗口已关闭，后台正在复核并保持 12306 会话");
+  } else {
+    await updateStatus(headless ? "starting" : "awaiting_login", headless ? "登录窗口已关闭，后台正在保持会话" : "请在打开的 12306 官方窗口中扫码并完成必要核验");
+  }
   polling = setInterval(inspectLoginState, 2000);
   context.on("close", () => {
     clearInterval(polling);
     polling = undefined;
     context = undefined;
     page = undefined;
-    if (!suppressCloseRecovery && status.state === "logged_in") {
+    if (!suppressCloseRecovery && authenticatedSessionObserved) {
       clearTimeout(recoveryTimer);
       recoveryTimer = setTimeout(() => startBrowser({ headless: true }).catch((error) => updateStatus("closed", `官方窗口已关闭，后台会话恢复失败：${error.message}`)), 800);
     } else if (!suppressCloseRecovery) {
@@ -229,6 +323,7 @@ async function logoutBrowser() {
   polling = undefined;
   passengerSnapshot = [];
   passengerSecrets.clear();
+  authenticatedSessionObserved = false;
   if (context) {
     await context.clearCookies();
     await context.close();
@@ -252,6 +347,44 @@ async function readJsonBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
+function updateQueueState(patch) {
+  orderQueueState = { ...orderQueueState, ...patch, updatedAt: new Date().toISOString() };
+  return orderQueueState;
+}
+
+async function monitorOfficialQueue(confirmPath) {
+  const deadline = Date.now() + ORDER_QUEUE_TIMEOUT_MS;
+  let lastWaitTime = null;
+  try {
+    while (Date.now() < deadline) {
+      const waitResponse = await page.waitForResponse((candidate) => candidate.url().includes("/confirmPassenger/queryOrderWaitTime"), { timeout: Math.min(ORDER_QUEUE_RESPONSE_TIMEOUT_MS, deadline - Date.now()) }).catch(() => null);
+      if (!waitResponse) continue;
+      const waitBody = await waitResponse.json().catch(() => null);
+      const orderId = waitBody?.data?.orderId;
+      lastWaitTime = Number.isFinite(waitBody?.data?.waitTime) ? waitBody.data.waitTime : lastWaitTime;
+      updateQueueState({ waitTime: lastWaitTime });
+      if (orderId) return updateQueueState({ status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(String(orderId)).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime, confirmPath });
+      if (lastWaitTime != null && lastWaitTime < 0) break;
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt > 0) await page.waitForTimeout(2000);
+      const pending = await page.evaluate(async () => {
+        try {
+          const officialResponse = await fetch("/otn/queryOrder/queryMyOrderNoComplete", { method: "POST", credentials: "include", headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" }, body: "_json_att=" });
+          const body = await officialResponse.json();
+          const orders = Array.isArray(body?.data?.orderDBList) ? body.data.orderDBList : Array.isArray(body?.data?.orders) ? body.data.orders : [];
+          const order = orders[0];
+          return body?.status === true && order ? String(order.sequence_no ?? order.order_id ?? order.orderId ?? "") : "";
+        } catch { return ""; }
+      });
+      if (pending) return updateQueueState({ status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(pending).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime, confirmPath });
+    }
+    return updateQueueState({ status: "UNKNOWN", orderRef: null, waitTime: lastWaitTime, confirmPath });
+  } catch (error) {
+    return updateQueueState({ status: "UNKNOWN", orderRef: null, waitTime: lastWaitTime, confirmPath, error: String(error?.message ?? error).slice(0, 160) });
+  }
+}
+
 http.createServer(async (request, response) => {
   try {
     const hostHeader = String(request.headers.host ?? "").split(":")[0].replace(/^\[|\]$/g, "");
@@ -265,6 +398,7 @@ http.createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/status") return send(response, 200, status);
     if (request.method === "POST" && request.url === "/logout") return send(response, 200, await logoutBrowser());
     if (request.method === "GET" && request.url === "/capabilities") return send(response, 200, { queryEnabled: true, realSubmissionEnabled });
+    if (request.method === "GET" && request.url === "/order/queue-status") return send(response, 200, { source: "12306_OFFICIAL", ...orderQueueState });
     if (request.method === "GET" && request.url === "/official-clock") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", now: officialClock?.epochMs ?? officialClock?.nowStr ?? null });
     if (request.method === "GET" && request.url === "/stations") {
       await ensureSearchPage();
@@ -306,7 +440,11 @@ http.createServer(async (request, response) => {
       await ensureSearchPage();
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", compatible: true, officialClock, conflictCheck });
     }
-    if (request.method === "POST" && request.url === "/start") return send(response, 200, await startBrowser());
+    if (request.method === "POST" && request.url === "/start") {
+      const input = await readJsonBody(request);
+      return send(response, 200, await startBrowser({ headless: input.visible === false }));
+    }
+    if (request.method === "GET" && request.url === "/login/qr") return send(response, 200, await captureLoginQrCode());
     if (request.method === "GET" && request.url === "/observe/network") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", entries: observations });
     if (request.method === "GET" && request.url === "/passengers") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", passengers: passengerSnapshot });
     if (request.method === "GET" && request.url === "/observe/account-links") {
@@ -372,7 +510,7 @@ http.createServer(async (request, response) => {
         return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), success: false, compatible: false, classification });
       }
       latestQuery = { input, candidates: rows.map(parseTicketCandidate) };
-      const result = { path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), responseKeys: Object.keys(body).sort(), dataKeys: body?.data && typeof body.data === "object" ? Object.keys(body.data).sort() : [], resultCount: rows.length, stationMapCount: body?.data?.map && typeof body.data.map === "object" ? Object.keys(body.data.map).length : null, success: body?.status === true, candidates: rows.map(parseTicketCandidate) };
+      const result = { path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), responseKeys: Object.keys(body).sort(), dataKeys: body?.data && typeof body.data === "object" ? Object.keys(body.data).sort() : [], resultCount: rows.length, stationMapCount: body?.data?.map && typeof body.data.map === "object" ? Object.keys(body.data.map).length : null, success: body?.status === true, candidates: latestQuery.candidates.map(publicTicketCandidate) };
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", ...result });
     }
     if (request.method === "POST" && request.url === "/observe/order-initialize") {
@@ -382,31 +520,34 @@ http.createServer(async (request, response) => {
       const train = latestQuery.candidates.find((candidate) => candidate.trainCode === input.trainCode && candidate.canBook);
       if (!train) return send(response, 409, { error: "最近查询中没有该可预订车次" });
       observations.length = 0;
-      const clickReserveAndWait = async () => {
-        const row = page.locator("#queryLeftTable tr").filter({ hasText: input.trainCode }).first();
-        if (!(await row.count())) return { error: "官方页面未找到对应车次行" };
-        const requestPromise = page.waitForResponse((candidate) => /submitOrderRequest/.test(candidate.url()), { timeout: 20000 }).catch(() => null);
-        await row.locator(".btn72").click();
-        const initResponse = await requestPromise;
-        const currentPath = new URL(page.url()).pathname;
-        if (initResponse || currentPath === "/otn/confirmPassenger/initDc") return { initResponse, currentPath };
-        return { error: "官方预订初始化未返回响应" };
-      };
-      let initialization = await clickReserveAndWait();
-      // submitOrderRequest only initializes the confirmation page and cannot create an order.
-      // One guarded retry is safe when the first click produced neither a response nor a page
-      // transition; this also covers a transient official-page event-handler race.
-      if (initialization.error === "官方预订初始化未返回响应") {
-        await ensureSearchPage();
-        initialization = await clickReserveAndWait();
-      }
-      if (initialization.error) return send(response, 409, { classification: "INCOMPATIBLE", error: initialization.error });
-      const initResponse = initialization.initResponse;
-      if (new URL(page.url()).pathname !== "/otn/confirmPassenger/initDc") {
-        await page.waitForURL((url) => url.pathname === "/otn/confirmPassenger/initDc", { timeout: 15000 }).catch(() => null);
-      }
-      await page.waitForTimeout(500);
-      return send(response, 200, { source: "12306_OFFICIAL_OBSERVATION", trainCode: input.trainCode, submitInitPath: initResponse ? new URL(initResponse.url()).pathname : "/otn/leftTicket/submitOrderRequest", submitInitStatus: initResponse?.status() ?? null, currentPath: new URL(page.url()).pathname, entries: observations });
+      // Do not click the rendered train row. That path waits for table event handlers and a
+      // browser redirect. Submit the exact secret from the immediately preceding official query,
+      // then load the official confirmation page only after 12306 accepts initialization.
+      const initialization = await page.evaluate(async ({ secretStr, query }) => {
+        const readValue = (selector, fallback) => document.querySelector(selector)?.value || fallback;
+        const body = new URLSearchParams({
+          secretStr: decodeURIComponent(secretStr),
+          train_date: query.travelDate,
+          back_train_date: readValue("#back_train_date", query.travelDate),
+          tour_flag: readValue("#tour_flag", "dc"),
+          purpose_codes: readValue("#purpose_codes", "ADULT"),
+          query_from_station_name: query.fromStation,
+          query_to_station_name: query.toStation,
+          undefined: "",
+        });
+        const officialResponse = await fetch("/otn/leftTicket/submitOrderRequest", {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" },
+          body: body.toString(),
+        });
+        const payload = await officialResponse.json().catch(() => null);
+        return { status: officialResponse.status, accepted: payload?.status === true, message: String(payload?.messages?.[0] ?? payload?.validateMessages?.[0] ?? "").replace(/\s+/g, " ").slice(0, 160) };
+      }, { secretStr: train.secretStr, query: latestQuery.input });
+      if (!initialization.accepted) return send(response, 409, { classification: "ORDER_INITIALIZATION_REJECTED", error: initialization.message ? `12306 订单初始化未通过：${initialization.message}` : "12306 订单初始化未通过" });
+      await page.goto("https://kyfw.12306.cn/otn/confirmPassenger/initDc", { waitUntil: "domcontentloaded", timeout: 15000 });
+      const currentPath = new URL(page.url()).pathname;
+      if (currentPath !== "/otn/confirmPassenger/initDc") return send(response, 409, { classification: "INCOMPATIBLE", error: "订单初始化后未进入官方确认页面" });
+      return send(response, 200, { source: "12306_OFFICIAL_OBSERVATION", trainCode: input.trainCode, submitInitPath: "/otn/leftTicket/submitOrderRequest", submitInitStatus: initialization.status, currentPath, entries: observations });
     }
     if (request.method === "GET" && request.url === "/observe/order-endpoints") {
       if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
@@ -510,12 +651,13 @@ http.createServer(async (request, response) => {
     }
     if (request.method === "POST" && request.url === "/order/execute") {
       if (!realSubmissionEnabled) return send(response, 423, { error: "真实提交环境门禁未启用" });
-      if (orderExecutionInProgress) return send(response, 409, { classification: "ORDER_EXECUTION_BUSY", error: "已有订单正在提交，账号级提交锁已拒绝并发执行" });
+      if (orderExecutionInProgress || orderQueueState.status === "QUEUING") return send(response, 409, { classification: "ORDER_EXECUTION_BUSY", error: "已有订单正在提交或排队，账号级提交锁已拒绝并发执行" });
       if (!page || page.isClosed() || !new URL(page.url()).pathname.includes("/confirmPassenger/initDc")) return send(response, 409, { error: "当前不在确认乘车人页面" });
       const input = await readJsonBody(request);
       if (input.confirmRealSubmission !== true || !Array.isArray(input.passengerRefs) || !input.passengerRefs.length || typeof input.seatTypeLabel !== "string") return send(response, 400, { error: "真实提交需要明确确认、乘车人和席别" });
       if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "当前会话需要重新完成 App 或 UAM 核验" });
       orderExecutionInProgress = true;
+      updateQueueState({ status: "IDLE", orderRef: null, waitTime: null, confirmPath: null, queueAcceptedAt: null, queueAcceptedDurationMs: null, error: null });
       try {
         for (const passengerRef of input.passengerRefs) {
           const passenger = passengerSecrets.get(passengerRef);
@@ -573,42 +715,32 @@ http.createServer(async (request, response) => {
           finalVisible = true;
         }
         if (!finalVisible) return send(response, 409, { classification: "INCOMPATIBLE", error: "官方订单核对弹窗未出现" });
-        await page.waitForTimeout(1000);
-        if (!(await finalButton.isEnabled())) return send(response, 409, { classification: "ORDER_CONFIRM_NOT_READY", error: "官方确认按钮尚不可用" });
+        const enableDeadline = Date.now() + 2000;
+        while (Date.now() < enableDeadline && !(await finalButton.isEnabled().catch(() => false))) await page.waitForTimeout(20);
+        if (!(await finalButton.isEnabled().catch(() => false))) return send(response, 409, { classification: "ORDER_CONFIRM_NOT_READY", error: "官方确认按钮在 2 秒内未就绪" });
+        // Confirmation and queueing are separate phases. First prove that the final click
+        // actually produced the official confirmation request; only an accepted response
+        // is allowed to enter the five-minute queue window.
         const confirmPromise = page.waitForResponse((candidate) => {
           const parsed = new URL(candidate.url());
-          return candidate.request().method() === "POST" && parsed.pathname.startsWith("/otn/confirmPassenger/") && /confirm.*Queue/i.test(parsed.pathname);
-        }, { timeout: 20000 }).catch(() => null);
+          return candidate.request().method() === "POST"
+            && parsed.pathname.startsWith("/otn/confirmPassenger/")
+            && !/checkOrderInfo|getQueueCount|queryOrderWaitTime/i.test(parsed.pathname)
+            && /confirm|queue/i.test(parsed.pathname);
+        }, { timeout: ORDER_CONFIRM_REQUEST_TIMEOUT_MS }).catch(() => null);
+        const finalClickStartedAt = Date.now();
         await finalButton.click();
         const confirmResponse = await confirmPromise;
-        if (!confirmResponse) return send(response, 200, { source: "12306_OFFICIAL", status: "QUEUING", orderRef: null, waitTime: null });
-        const confirmBody = await confirmResponse.json();
-        if (confirmBody?.data?.submitStatus !== true) return send(response, 409, { classification: "QUEUE_CONFIRM_REJECTED", error: "官方排队确认未通过" });
-        const deadline = Date.now() + 90000;
-        let lastWaitTime = null;
-        while (Date.now() < deadline) {
-          const waitResponse = await page.waitForResponse((candidate) => candidate.url().includes("/confirmPassenger/queryOrderWaitTime"), { timeout: Math.min(35000, deadline - Date.now()) }).catch(() => null);
-          if (!waitResponse) break;
-          const waitBody = await waitResponse.json().catch(() => null);
-          const orderId = waitBody?.data?.orderId;
-          lastWaitTime = Number.isFinite(waitBody?.data?.waitTime) ? waitBody.data.waitTime : lastWaitTime;
-          if (orderId) return send(response, 200, { source: "12306_OFFICIAL", status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(String(orderId)).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime });
-          if (lastWaitTime != null && lastWaitTime < 0) break;
+        if (!confirmResponse) return send(response, 409, { classification: "ORDER_CONFIRM_NOT_SENT", error: "点击最终确认后 30 秒内未观察到 12306 排队请求，未进入排队阶段" });
+        const confirmPath = new URL(confirmResponse.url()).pathname;
+        const confirmBody = await confirmResponse.json().catch(() => null);
+        if (confirmBody?.data?.submitStatus !== true) {
+          const officialMessage = String(confirmBody?.data?.errMsg ?? confirmBody?.messages?.[0] ?? confirmBody?.validateMessages?.[0] ?? "").replace(/\s+/g, " ").slice(0, 160);
+          return send(response, 409, { classification: "QUEUE_CONFIRM_REJECTED", error: officialMessage ? `12306 排队确认未通过：${officialMessage}` : "12306 排队确认未通过", confirmPath });
         }
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          if (attempt > 0) await page.waitForTimeout(2000);
-          const pending = await page.evaluate(async () => {
-            try {
-              const officialResponse = await fetch("/otn/queryOrder/queryMyOrderNoComplete", { method: "POST", credentials: "include", headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" }, body: "_json_att=" });
-              const body = await officialResponse.json();
-              const orders = Array.isArray(body?.data?.orderDBList) ? body.data.orderDBList : Array.isArray(body?.data?.orders) ? body.data.orders : [];
-              const order = orders[0];
-              return body?.status === true && order ? String(order.sequence_no ?? order.order_id ?? order.orderId ?? "") : "";
-            } catch { return ""; }
-          });
-          if (pending) return send(response, 200, { source: "12306_OFFICIAL", status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(pending).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime });
-        }
-        return send(response, 200, { source: "12306_OFFICIAL", status: "QUEUING", orderRef: null, waitTime: lastWaitTime });
+        const accepted = updateQueueState({ status: "QUEUING", orderRef: null, waitTime: null, confirmPath, queueAcceptedAt: new Date().toISOString(), queueAcceptedDurationMs: Date.now() - finalClickStartedAt });
+        void monitorOfficialQueue(confirmPath);
+        return send(response, 200, { source: "12306_OFFICIAL", ...accepted });
       } finally {
         orderExecutionInProgress = false;
       }
