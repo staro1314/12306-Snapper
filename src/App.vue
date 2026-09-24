@@ -25,6 +25,7 @@ const events = ref<ExecutionEvent[]>([]);
 const taskEvents = ref<Record<string, ExecutionEvent[]>>({});
 const expandedTaskLogs = reactive<Record<string, boolean>>({});
 const taskLogsSyncing = ref(false);
+const taskLogStreamState = ref<"offline" | "connecting" | "live" | "reconnecting">("offline");
 const taskLogClock = ref(Date.now());
 const rehearsalOutcome = ref("");
 const editingTaskId = ref("");
@@ -47,8 +48,10 @@ const schedulerMessage = ref("调度器待命");
 const schedulerHeartbeatAt = ref<number | null>(null);
 const browserCapabilities = ref<BrowserCapabilities | null>(null);
 const notificationSelfTestPassed = ref(localStorage.getItem("fast12306.notificationSelfTest") === "passed");
+const notifiedPendingOrderIds = new Set<string>();
 let loginPollTimer: number | undefined;
 let taskLogTimer: number | undefined;
+let taskLogStream: EventSource | undefined;
 let lastClockSyncAt = 0;
 const officialClockOffsetMs = ref<number | null>(null);
 let alertSoundTimer: number | undefined;
@@ -121,15 +124,19 @@ const passengerOptions = computed(() => {
 });
 const validPassengerCount = computed(() => officialPassengers.value.filter((item) => item.verified).length);
 const isAuthenticated = computed(() => browserSession.value?.state === "logged_in");
+watch(isAuthenticated, (authenticated) => {
+  if (authenticated) connectTaskLogStream();
+  else disconnectTaskLogStream();
+});
 
 const statusLabel = computed(() => protocol.value ? ({ unverified: "协议未验证", readOnlyCompatible: "只读兼容", compatible: "兼容", incompatible: "不兼容" })[protocol.value.status] : "检查中");
 const readyTaskCount = computed(() => tasks.value.filter((task) => task.status === "READY" || task.status === "ARMED").length);
-const attentionTaskCount = computed(() => tasks.value.filter((task) => ["INCOMPATIBLE", "USER_ACTION_REQUIRED", "RATE_LIMITED", "FAILED"].includes(task.status)).length);
+const attentionTaskCount = computed(() => tasks.value.filter((task) => ["INCOMPATIBLE", "USER_ACTION_REQUIRED", "RATE_LIMITED", "FAILED", "UNKNOWN_RECONCILING"].includes(task.status)).length);
 const viewTitle = computed(() => ({ overview: "运行概览", login: "12306 登录", tasks: "抢票任务", create: "新建任务", orders: "订单核对", rehearsal: "测试演练", system: "系统与协议" })[activeView.value]);
-const taskStatusLabels: Record<string, string> = { DRAFT: "草稿", PREFLIGHT: "预检中", READY: "已就绪", ARMED: "等待起售", QUERYING: "查询中", CANDIDATE_SELECTED: "已选中候选", ORDER_INITIALIZING: "准备订单", ORDER_SUBMITTING: "提交订单", QUEUING: "排队中", PAYMENT_PENDING: "待支付", USER_ACTION_REQUIRED: "需要人工处理", RATE_LIMITED: "已停止请求", INCOMPATIBLE: "协议未兼容", UNKNOWN_RECONCILING: "正在核对订单", PARTIAL_PAYMENT_PENDING: "部分乘车人待支付", CANCELLED: "已放弃", EXPIRED: "已过期", PAID: "已支付", FAILED: "失败" };
-const eventStageLabels: Record<string, string> = { TASK_START: "启动任务", TASK_ARMED: "等待起售", TASK_STOPPED: "停止任务", TASK_ABANDONED: "放弃任务", MANUAL_QUERY: "手动查询", PREFLIGHT: "任务预检", SCHEDULER_DISPATCH: "调度触发", QUERY_ROUND_TRIP: "查询余票", CANDIDATE_DECISION: "筛选候选", SUBMISSION_GATE: "提交检查", ORDER_INITIALIZATION: "初始化订单", ORDER_SUBMISSION: "提交订单", QUEUE_ACCEPTED: "进入排队", ORDER_RECONCILIATION: "核对订单", NOTIFICATION: "发送提醒" };
-const eventOutcomeLabels: Record<string, string> = { STARTED: "进行中", ACTIVE: "运行中", PASSED: "成功", SELECTED: "已命中", NO_AVAILABILITY: "暂无余票", PAYMENT_PENDING: "待支付", QUEUING: "排队中", STOPPED: "已停止", FAILED: "失败", BLOCKED: "已阻止", EMPTY: "未发现订单", UNKNOWN: "状态未知" };
-const liveTaskStatuses = new Set(["ARMED", "QUERYING", "CANDIDATE_SELECTED", "ORDER_INITIALIZING", "ORDER_SUBMITTING", "QUEUING", "UNKNOWN_RECONCILING"]);
+const taskStatusLabels: Record<string, string> = { DRAFT: "草稿", PREFLIGHT: "预检中", READY: "已就绪", ARMED: "等待起售", QUERYING: "查询中", CANDIDATE_SELECTED: "已选中候选", ORDER_INITIALIZING: "准备订单", ORDER_SUBMITTING: "提交订单", QUEUING: "排队中", PAYMENT_PENDING: "待支付", USER_ACTION_REQUIRED: "需要人工处理", RATE_LIMITED: "已停止请求", INCOMPATIBLE: "协议未兼容", UNKNOWN_RECONCILING: "订单结果待核对", PARTIAL_PAYMENT_PENDING: "部分乘车人待支付", CANCELLED: "已放弃", EXPIRED: "已过期", PAID: "已支付", FAILED: "失败" };
+const eventStageLabels: Record<string, string> = { TASK_START: "启动任务", TASK_ARMED: "等待起售", TASK_STOPPED: "停止任务", TASK_ABANDONED: "放弃任务", MANUAL_QUERY: "手动查询", PREFLIGHT: "任务预检", PREFLIGHT_QUERY: "预热余票查询", SCHEDULER_DISPATCH: "调度触发", QUERY_REQUEST: "发起余票查询", OFFICIAL_QUERY: "官方余票接口", QUERY_ROUND_TRIP: "查询余票响应", CANDIDATE_DECISION: "筛选候选", SUBMISSION_GATE: "提交检查", ORDER_PLAN: "订单计划", ORDER_INITIALIZATION: "初始化订单", OFFICIAL_INIT: "官方订单初始化", ORDER_SUBMISSION: "提交订单", OFFICIAL_FORM: "官方确认页", OFFICIAL_CHECK: "官方预检查", OFFICIAL_CONFIRM: "最终确认", OFFICIAL_QUEUE: "官方排队状态", OFFICIAL_RECONCILIATION: "官方查单", QUEUE_ACCEPTED: "进入排队", QUEUE_MONITOR: "排队监控", ORDER_RECONCILIATION: "核对订单", NOTIFICATION: "发送提醒" };
+const eventOutcomeLabels: Record<string, string> = { STARTED: "进行中", ACTIVE: "运行中", PASSED: "成功", SELECTED: "已命中", NO_AVAILABILITY: "暂无余票", NO_ORDER: "未生成订单", NOT_READY: "未完成", NOT_SUBMITTED: "未提交", PAYMENT_PENDING: "待支付", QUEUING: "排队中", WAITING: "等待中", TRIGGERED: "已触发", STOPPED: "已停止", FAILED: "失败", BLOCKED: "已阻止", EMPTY: "未发现订单", UNKNOWN: "状态未知" };
+const liveTaskStatuses = new Set(["ARMED", "QUERYING", "CANDIDATE_SELECTED", "ORDER_INITIALIZING", "ORDER_SUBMITTING", "QUEUING"]);
 const performanceStats = computed(() => ["SCHEDULER_DISPATCH", "QUERY_ROUND_TRIP", "CANDIDATE_DECISION", "ORDER_INITIALIZATION", "QUEUE_ACCEPTED", "ORDER_SUBMISSION"].map((stage) => {
   const values = events.value.filter((event) => event.source === "12306_OFFICIAL_RUNTIME" && event.stage === stage && event.durationMs != null).map((event) => event.durationMs as number).sort((a,b) => a-b);
   return { stage, samples: values.length, p95: values.length ? values[Math.ceil(values.length * 0.95) - 1] : null };
@@ -142,7 +149,7 @@ function taskRuntimeHeadline(task: TicketTaskView) {
   if (task.status === "ARMED") return schedulerHeartbeatAt.value != null && taskLogClock.value - schedulerHeartbeatAt.value < 5000 ? "Rust 后台正在监控，等待起售" : "后台调度器心跳异常";
   if (task.status === "QUERYING") return "正在向 12306 查询余票";
   if (["CANDIDATE_SELECTED", "ORDER_INITIALIZING", "ORDER_SUBMITTING", "QUEUING"].includes(task.status)) return "已命中车票，正在执行订单流程";
-  if (task.status === "UNKNOWN_RECONCILING") return "提交结果未知，正在核对官方订单";
+  if (task.status === "UNKNOWN_RECONCILING") return "订单结果未确认，请核对官方订单";
   if (["PAYMENT_PENDING", "PARTIAL_PAYMENT_PENDING"].includes(task.status)) return "已生成待支付订单";
   if (["USER_ACTION_REQUIRED", "RATE_LIMITED", "INCOMPATIBLE", "FAILED"].includes(task.status)) return "任务已暂停，需要处理";
   if (task.status === "CANCELLED") return "任务已放弃";
@@ -183,7 +190,29 @@ function schedulerHeartbeatTime() { return schedulerHeartbeatAt.value == null ? 
 function mergeTaskEvent(event: ExecutionEvent) {
   const existing = taskEvents.value[event.taskId] ?? [];
   if (existing.some((item) => item.id === event.id)) return;
-  taskEvents.value = { ...taskEvents.value, [event.taskId]: [event, ...existing].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 100) };
+  taskEvents.value = { ...taskEvents.value, [event.taskId]: [event, ...existing].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 500) };
+}
+function mergeTaskEventHistory(taskId: string, latest: ExecutionEvent[]) {
+  const byId = new Map<string, ExecutionEvent>();
+  for (const event of [...(taskEvents.value[taskId] ?? []), ...latest]) byId.set(event.id, event);
+  taskEvents.value = { ...taskEvents.value, [taskId]: [...byId.values()].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 500) };
+}
+function connectTaskLogStream() {
+  if (taskLogStream || !("EventSource" in window)) return;
+  taskLogStreamState.value = "connecting";
+  const stream = new EventSource("/api/events/stream");
+  taskLogStream = stream;
+  stream.onopen = () => { taskLogStreamState.value = "live"; void syncTaskLogs(true); };
+  stream.onerror = () => { taskLogStreamState.value = "reconnecting"; };
+  stream.addEventListener("execution", (raw) => {
+    try { mergeTaskEvent(JSON.parse((raw as MessageEvent).data) as ExecutionEvent); }
+    catch { taskLogStreamState.value = "reconnecting"; }
+  });
+}
+function disconnectTaskLogStream() {
+  taskLogStream?.close();
+  taskLogStream = undefined;
+  taskLogStreamState.value = "offline";
 }
 async function emitRuntimeEvent(input: Parameters<typeof recordRuntimeEvent>[0]) {
   const event = await recordRuntimeEvent(input);
@@ -191,23 +220,50 @@ async function emitRuntimeEvent(input: Parameters<typeof recordRuntimeEvent>[0])
   return event;
 }
 async function loadTaskEvents(taskId: string) {
-  const latest = await listEvents(taskId, 100);
-  taskEvents.value = { ...taskEvents.value, [taskId]: latest };
+  const latest = await listEvents(taskId, 500);
+  mergeTaskEventHistory(taskId, latest);
 }
-async function syncTaskLogs() {
-  if (taskLogsSyncing.value || !isAuthenticated.value || activeView.value !== "tasks" || tasks.value.length === 0) return;
+async function syncTaskLogs(forceHistory = false) {
+  if (taskLogsSyncing.value || !isAuthenticated.value) return;
   taskLogsSyncing.value = true;
   try {
-    const [results, latestTasks, runtime] = await Promise.all([
-      Promise.all(tasks.value.map(async (task) => [task.id, await listEvents(task.id, 100)] as const)),
+    const [latestTasks, latestOrders, runtime] = await Promise.all([
       listTasks(),
+      listOrderSnapshots(),
       getRuntimeStatus(),
     ]);
-    taskEvents.value = { ...taskEvents.value, ...Object.fromEntries(results) };
     tasks.value = latestTasks;
+    orders.value = latestOrders;
     schedulerHeartbeatAt.value = runtime.healthy && runtime.heartbeatAt ? new Date(runtime.heartbeatAt).getTime() : null;
+    await notifyPendingOrders(latestOrders, latestTasks);
+    if (activeView.value === "tasks" && latestTasks.length > 0 && (forceHistory || taskLogStreamState.value !== "live")) {
+      const results = await Promise.all(latestTasks.map(async (task) => [task.id, await listEvents(task.id, 500)] as const));
+      for (const [taskId, latest] of results) mergeTaskEventHistory(taskId, latest);
+    }
   } catch { /* The next one-second sync retries; task execution itself must not be stopped by a log display failure. */ }
   finally { taskLogsSyncing.value = false; }
+}
+async function notifyPendingOrders(snapshots: OrderSnapshot[], currentTasks: TicketTaskView[]) {
+  for (const order of snapshots) {
+    if (order.status !== "PAYMENT_PENDING" || notifiedPendingOrderIds.has(order.localId)) continue;
+    const task = currentTasks.find((item) => item.id === order.taskId);
+    // Historical local snapshots can outlive the corresponding task or official payment window.
+    // Only a current task that reached the real pending-payment state may trigger a new alert.
+    if (!task || !["PAYMENT_PENDING", "PARTIAL_PAYMENT_PENDING"].includes(task.status)) continue;
+    const reconciledAt = new Date(order.lastReconciledAt).getTime();
+    if (!Number.isFinite(reconciledAt) || Date.now() - reconciledAt > 30 * 60_000) continue;
+    notifiedPendingOrderIds.add(order.localId);
+    const detail = await getTask(order.taskId).catch(() => null);
+    const trainCode = detail?.routeGroups.find((route) => route.trainCodes.length > 0)?.trainCodes[0] ?? "待支付订单";
+    const partial = task?.status === "PARTIAL_PAYMENT_PENDING" || (detail != null && order.passengerRefs.length < detail.passengers.length);
+    strongPaymentNotification(trainCode, partial);
+    void emitRuntimeEvent({
+      taskId: order.taskId,
+      stage: "NOTIFICATION",
+      outcome: "TRIGGERED",
+      message: `${trainCode} 已确认真实待支付订单并触发客户端内提醒；系统通知受本机权限与宿主支持情况影响`,
+    }).catch(() => undefined);
+  }
 }
 async function toggleTaskLog(taskId: string) {
   expandedTaskLogs[taskId] = !expandedTaskLogs[taskId];
@@ -312,10 +368,10 @@ async function loadPassengers() {
 function addRoute() { if (additionalRoutes.value.length >= 4) return; additionalRoutes.value.push({ id: crypto.randomUUID(), travelDate: form.travelDate, fromStation: form.fromStation, toStation: form.toStation, saleTime: form.saleTime, priority: additionalRoutes.value.length + 2, trainCodes: form.trainCodes, seatTypes: form.seatTypes }); }
 function removeRoute(index: number) { const [removed] = additionalRoutes.value.splice(index, 1); if (removed) delete routeQueryCandidates[removed.id]; }
 function priorityOptions(current: number) { return [...new Set([...Array.from({ length: Math.max(10, tasks.value.length + 1) }, (_, index) => index + 1), current])].sort((a, b) => a - b); }
-function localDateTime(value: string) {
+function localDateTime(value: string, withSeconds = false) {
   const date = new Date(value);
   const pad = (part: number) => String(part).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}${withSeconds ? `:${pad(date.getSeconds())}` : ""}`;
 }
 function selectedTrainCodes(value: string) { return value.split(/[,，\s]+/).filter(Boolean); }
 function selectedSeatTypes(value: string) { return value.split(/[,，\s]+/).filter(Boolean); }
@@ -367,7 +423,7 @@ async function lookupSaleTime() {
     if (!form.fromStation.trim()) throw new Error("请先填写出发站");
     const result = await getOfficialSaleTime(form.fromStation.trim());
     const datePart = form.saleTime.slice(0, 10);
-    if (datePart) form.saleTime = `${datePart}T${result.saleTime}`;
+    if (datePart) form.saleTime = `${datePart}T${result.saleTime}:00`;
     saleTimeLookupMessage.value = `${result.stationName}站官方当前起售时刻为 ${result.saleTime}${datePart ? "，已填入" : "；请选择起售日期后填写"}`;
   } catch (cause) { error.value = String(cause); }
 }
@@ -377,7 +433,7 @@ async function lookupRouteSaleTime(route: RouteDraft) {
     if (!route.fromStation.trim()) throw new Error("请先填写备选路线出发站");
     const result = await getOfficialSaleTime(route.fromStation.trim());
     const datePart = route.saleTime.slice(0, 10);
-    if (datePart) route.saleTime = `${datePart}T${result.saleTime}`;
+    if (datePart) route.saleTime = `${datePart}T${result.saleTime}:00`;
     saleTimeLookupMessage.value = `${result.stationName}站官方当前起售时刻为 ${result.saleTime}${datePart ? "，已填入备选路线" : "；请先选择该路线的起售日期"}`;
   } catch (cause) { error.value = String(cause); }
 }
@@ -410,7 +466,7 @@ async function submitTask() {
 function resetForm() { editingTaskId.value = ""; editingTask.value = null; selectedPassengerRefs.value = []; additionalRoutes.value = []; formQueryCandidates.value = []; formQueryMessage.value = ""; for (const key of Object.keys(routeQueryCandidates)) delete routeQueryCandidates[key]; Object.assign(form, { name: "", priority: 1, travelDate: "", fromStation: "", toStation: "", saleTime: "", deadline: "", trainCodes: "", seatTypes: "二等座", passengerRef: "", passengerName: "", splitAuthorized: false, realSubmissionAuthorized: false }); }
 async function editTask(taskId: string) {
   busy.value = true; error.value = "";
-  try { const task = await getTask(taskId); const route = task.routeGroups[0]; editingTaskId.value = task.id; editingTask.value = task; selectedPassengerRefs.value = task.passengers.sort((a,b) => a.priority - b.priority).map((passenger) => passenger.passengerRef); additionalRoutes.value = task.routeGroups.slice(1).map((item) => ({ id: item.id, travelDate: item.travelDate, fromStation: item.fromStation, toStation: item.toStation, saleTime: localDateTime(item.saleTime), priority: item.priority, trainCodes: item.trainCodes.join(", "), seatTypes: item.seatTypes.join(", ") })); Object.assign(form, { name: task.name, priority: task.priority, travelDate: route.travelDate, fromStation: route.fromStation, toStation: route.toStation, saleTime: localDateTime(route.saleTime), deadline: task.deadline ? localDateTime(task.deadline) : "", trainCodes: route.trainCodes.join(", "), seatTypes: route.seatTypes.join(", "), splitAuthorized: task.splitAuthorized, realSubmissionAuthorized: task.realSubmissionAuthorized }); activeView.value = "create"; }
+  try { const task = await getTask(taskId); const route = task.routeGroups[0]; editingTaskId.value = task.id; editingTask.value = task; selectedPassengerRefs.value = task.passengers.sort((a,b) => a.priority - b.priority).map((passenger) => passenger.passengerRef); additionalRoutes.value = task.routeGroups.slice(1).map((item) => ({ id: item.id, travelDate: item.travelDate, fromStation: item.fromStation, toStation: item.toStation, saleTime: localDateTime(item.saleTime, true), priority: item.priority, trainCodes: item.trainCodes.join(", "), seatTypes: item.seatTypes.join(", ") })); Object.assign(form, { name: task.name, priority: task.priority, travelDate: route.travelDate, fromStation: route.fromStation, toStation: route.toStation, saleTime: localDateTime(route.saleTime, true), deadline: task.deadline ? localDateTime(task.deadline) : "", trainCodes: route.trainCodes.join(", "), seatTypes: route.seatTypes.join(", "), splitAuthorized: task.splitAuthorized, realSubmissionAuthorized: task.realSubmissionAuthorized }); activeView.value = "create"; }
   catch (cause) { error.value = String(cause); } finally { busy.value = false; }
 }
 
@@ -472,12 +528,18 @@ async function queryTask(taskId: string) {
 }
 async function reconcileOrders() {
   busy.value = true; error.value = "";
-  try { const result = await reconcileOfficialOrders(); const recovered = await persistReconciledUnknowns(result); reconciliationMessage.value = result.classification === "EMPTY" ? "官方确认当前没有未支付订单；未知任务保持停止，需人工决定是否重新预检" : result.classification === "UNKNOWN_STRUCTURE" ? "官方订单结构未知，已停止自动恢复" : `官方返回 ${result.orders?.length ?? 0} 个待支付订单`; orders.value = await listOrderSnapshots(); tasks.value = await listTasks(); if (result.classification === "PAYMENT_PENDING" && (result.orders?.length ?? 0) > 0) strongPaymentNotification(recovered[0]?.trainCode ?? "待支付订单", recovered[0]?.partial ?? false); }
+  try {
+    const result = await reconcileOfficialOrders();
+    await persistReconciledUnknowns(result);
+    reconciliationMessage.value = result.classification === "EMPTY" ? "当前官方未支付订单为空；若任务曾触发提交，单次查单为空仍不能证明从未生成订单，任务保持停止" : result.classification === "UNKNOWN_STRUCTURE" ? "官方订单结构未知，已停止自动恢复" : `官方返回 ${result.orders?.length ?? 0} 个待支付订单`;
+    orders.value = await listOrderSnapshots();
+    tasks.value = await listTasks();
+    await notifyPendingOrders(orders.value, tasks.value);
+  }
   catch (cause) { error.value = String(cause); } finally { busy.value = false; }
 }
-async function persistReconciledUnknowns(result: Awaited<ReturnType<typeof reconcileOfficialOrders>>) {
-  const recovered: Array<{ trainCode: string; partial: boolean }> = [];
-  if (result.classification !== "PAYMENT_PENDING") return recovered;
+async function persistReconciledUnknowns(result: Awaited<ReturnType<typeof reconcileOfficialOrders>>): Promise<void> {
+  if (result.classification !== "PAYMENT_PENDING") return;
   const candidates = await Promise.all(tasks.value.filter((task) => task.status === "UNKNOWN_RECONCILING").sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).map((task) => getTask(task.id)));
   const claimedTasks = new Set<string>();
   for (const order of result.orders ?? []) {
@@ -486,13 +548,18 @@ async function persistReconciledUnknowns(result: Awaited<ReturnType<typeof recon
     const partial = order.passengerRefs.length < detail.passengers.length;
     await recordOrderResult({ taskId: detail.id, officialOrderRef: order.orderRef, status: "PAYMENT_PENDING", passengerRefs: order.passengerRefs, paymentDeadline: order.paymentDeadline, partial });
     claimedTasks.add(detail.id);
-    recovered.push({ trainCode: detail.routeGroups[0]?.trainCodes[0] ?? "订单", partial });
   }
-  return recovered;
 }
 async function recoverAfterRestart() {
   if (browserSession.value?.state !== "logged_in" || (!tasks.value.some((task) => task.status === "UNKNOWN_RECONCILING") && !orders.value.some((order) => order.status === "PAYMENT_PENDING"))) return;
-  try { const result = await reconcileOfficialOrders(); const recovered = await persistReconciledUnknowns(result); tasks.value = await listTasks(); orders.value = await listOrderSnapshots(); schedulerMessage.value = result.classification === "EMPTY" ? "重启恢复查单为空，未知任务保持停止" : "已完成重启后的官方订单核对"; if (result.classification === "PAYMENT_PENDING" && (result.orders?.length ?? 0) > 0) strongPaymentNotification(recovered[0]?.trainCode ?? "待支付订单", recovered[0]?.partial ?? false); }
+  try {
+    const result = await reconcileOfficialOrders();
+    await persistReconciledUnknowns(result);
+    tasks.value = await listTasks();
+    orders.value = await listOrderSnapshots();
+    schedulerMessage.value = result.classification === "EMPTY" ? "重启查单为空，真实未知任务仍需核对" : "已完成重启后的官方订单核对";
+    await notifyPendingOrders(orders.value, tasks.value);
+  }
   catch { schedulerMessage.value = "重启恢复需要人工打开 12306 完成核验"; }
 }
 const seatSummary = (candidate: TicketQueryCandidate) => Object.entries(candidate.seats).filter(([, value]) => value && value !== "无" && value !== "--").slice(0, 4).map(([key, value]) => `${({ business: "商务", firstClass: "一等", secondClass: "二等", softSleeper: "软卧", hardSleeper: "硬卧", hardSeat: "硬座", noSeat: "无座", other: "其他" } as Record<string,string>)[key] ?? key} ${value}`).join(" · ") || "暂无可选席别";
@@ -510,8 +577,11 @@ function strongPaymentNotification(trainCode: string, partial: boolean) {
   stopPaymentAlert();
   paymentAlert.value = { trainCode, partial, confirmedAt: new Date().toISOString() };
   schedulerMessage.value = partial ? `${trainCode} 已生成部分待支付订单，请立即处理` : `${trainCode} 已生成待支付订单，请立即支付`;
-  if ("Notification" in window && Notification.permission === "granted") new Notification(partial ? "部分乘车人已生成待支付订单" : "12306 待支付订单已生成", { body: `${trainCode}：请立即前往官方页面核对并支付`, requireInteraction: true });
-  playAlertTone();
+  if ("Notification" in window && Notification.permission === "granted") {
+    try { new Notification(partial ? "部分乘车人已生成待支付订单" : "12306 待支付订单已生成", { body: `${trainCode}：请立即前往官方页面核对并支付`, requireInteraction: true }); }
+    catch { /* The in-app alert remains available if the host blocks desktop notifications. */ }
+  }
+  try { playAlertTone(); } catch { /* Audio can be blocked by browser autoplay policy. */ }
   alertSoundTimer = window.setInterval(playAlertTone, 5000);
   let highlighted = false;
   alertTitleTimer = window.setInterval(() => { highlighted = !highlighted; document.title = highlighted ? "【待支付】Fast 12306" : "Fast 12306"; }, 800);
@@ -545,7 +615,7 @@ onMounted(async () => {
   // refreshes observable state; running a second scheduler here could create duplicate orders.
   taskLogTimer = window.setInterval(() => { taskLogClock.value = Date.now(); void syncTaskLogs(); }, 1000);
 });
-onBeforeUnmount(() => { if (taskLogTimer) window.clearInterval(taskLogTimer); stopLoginPolling(); stopPaymentAlert(); });
+onBeforeUnmount(() => { if (taskLogTimer) window.clearInterval(taskLogTimer); disconnectTaskLogStream(); stopLoginPolling(); stopPaymentAlert(); });
 </script>
 
 <template>
@@ -627,7 +697,7 @@ onBeforeUnmount(() => { if (taskLogTimer) window.clearInterval(taskLogTimer); st
         <article v-for="task in tasks" :key="task.id" class="task-card module">
           <div class="task-row">
             <div><small>优先级 {{ task.priority }} · {{ task.passengerCount }} 人 · {{ task.routeGroupCount }} 路线<span v-if="task.deadline"> · 截止 {{ new Date(task.deadline).toLocaleString() }}</span></small><h3>{{ task.name }}</h3><p v-if="task.failureReason" class="failure">{{ displayFailureReason(task.failureReason) }}</p></div>
-            <div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div>
+            <div class="task-actions"><span class="badge">{{ taskStatusLabels[task.status] ?? "状态未知" }}</span><div><button class="secondary" :disabled="busy" @click="queryTask(task.id)">查询余票</button><button v-if="task.status === 'UNKNOWN_RECONCILING'" class="secondary" :disabled="busy" @click="reconcileOrders">核对官方订单</button><button v-if="startableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="startTask(task)">启动任务</button><button v-if="stoppableTaskStatuses.includes(task.status)" class="secondary" :disabled="busy" @click="stopTask(task)">停止任务</button><button v-if="abandonableTaskStatuses.includes(task.status)" class="secondary abandon-action" :disabled="busy" @click="abandonLocalTask(task)">放弃任务</button><button class="secondary" :disabled="busy || !canEditTask(task)" @click="editTask(task.id)">编辑</button><button class="danger-action" :disabled="busy || !canRemoveTask(task)" @click="removeTask(task.id)">删除</button></div></div>
           </div>
           <section class="task-runtime" :class="taskRuntimeClass(task)" aria-live="polite">
             <div class="task-runtime-summary">
@@ -637,13 +707,14 @@ onBeforeUnmount(() => { if (taskLogTimer) window.clearInterval(taskLogTimer); st
               <button class="runtime-toggle" type="button" @click="toggleTaskLog(task.id)">{{ expandedTaskLogs[task.id] ? "收起日志" : "查看执行日志" }}<span>{{ expandedTaskLogs[task.id] ? "↑" : "↓" }}</span></button>
             </div>
             <div v-if="expandedTaskLogs[task.id]" class="task-runtime-log">
-              <div class="runtime-log-head"><strong>实时执行记录</strong><span><i></i>每秒自动刷新</span></div>
+              <div class="runtime-log-head"><strong>真实执行流水 · {{ runtimeEvents(task.id).length }} 条</strong><span :class="{ 'stream-disconnected': taskLogStreamState !== 'live' }"><i></i>{{ taskLogStreamState === "live" ? "事件实时推送" : taskLogStreamState === "connecting" ? "正在连接事件流" : "推送断线，每秒补读" }}</span></div>
+              <p class="runtime-log-note">等待起售时只更新倒计时和调度心跳；真实查询、官方响应、确认和排队发生时才新增记录。以官方待支付订单为最终结果。</p>
               <div v-if="runtimeEvents(task.id).length === 0" class="runtime-empty">尚无执行记录。点击“启动任务”后，这里会立即显示预检和调度状态。</div>
               <ol v-else class="runtime-timeline">
                 <li v-for="event in runtimeEvents(task.id)" :key="event.id">
-                  <time>{{ new Date(event.createdAt).toLocaleTimeString() }}</time>
+                  <time :title="new Date(event.createdAt).toLocaleString()">{{ new Date(event.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, fractionalSecondDigits: 3 }) }}</time>
                   <span class="timeline-dot"></span>
-                  <div><div><strong>{{ eventStageLabels[event.stage] ?? event.stage }}</strong><em :class="`outcome-${event.outcome.toLowerCase()}`">{{ eventOutcomeLabels[event.outcome] ?? event.outcome }}</em></div><p>{{ event.message }}<template v-if="event.durationMs != null"> · {{ event.durationMs.toFixed(1) }} ms</template></p></div>
+                  <div><div><strong>{{ eventStageLabels[event.stage] ?? event.stage }}</strong><em :class="`outcome-${event.outcome.toLowerCase()}`">{{ eventOutcomeLabels[event.outcome] ?? event.outcome }}</em><small>{{ event.stage.startsWith("OFFICIAL_") ? "官方页面观测" : "后台执行" }}</small></div><p>{{ event.message }}<template v-if="event.durationMs != null"> · 耗时 {{ event.durationMs.toFixed(1) }} ms</template></p></div>
                 </li>
               </ol>
             </div>
@@ -658,13 +729,13 @@ onBeforeUnmount(() => { if (taskLogTimer) window.clearInterval(taskLogTimer); st
         <form class="task-form" @submit.prevent="submitTask">
           <section class="form-section module">
             <div class="section-intro"><span>1</span><div><h2>行程与优先级</h2><p>定义起售时间、截止时间、路线以及优先选择的车次和席别。路线组按优先级依次执行。</p></div></div>
-            <div class="fields two"><label>任务名称<input v-model="form.name" required placeholder="例如：国庆返程" /></label><label>任务优先级<select v-model.number="form.priority"><option v-for="priority in priorityOptions(form.priority)" :key="priority" :value="priority">{{ priority }}{{ priority === 1 ? "（最高）" : "" }}</option></select></label><label>乘车日期<DatePicker v-model="form.travelDate" label="乘车日期" :min-date="todayDate" @update:model-value="clearFormTrains" /></label><label>官方起售日期与时间<DatePicker v-model="form.saleTime" label="官方起售日期与时间" :min-date="todayDate" with-time /></label><label>任务截止时间（可选）<DatePicker v-model="form.deadline" label="任务截止时间" :min-date="todayDate" with-time optional /><small>到时停止新查询，不会取消已生成订单。</small></label><label>出发站<StationPicker v-model="form.fromStation" :options="stationOptions" required aria-label="出发站" placeholder="输入车站名称搜索" @update:model-value="clearFormTrains" /></label><label>到达站<StationPicker v-model="form.toStation" :options="stationOptions" required aria-label="到达站" placeholder="输入车站名称搜索" @update:model-value="clearFormTrains" /></label><label>优先车次<button class="selection-output selection-trigger" type="button" :disabled="busy" @click="queryFormRoute">{{ form.trainCodes || "点击查询并选择车次" }}<span>查询</span></button></label><label>优先席别<output class="selection-output">{{ form.seatTypes || "请选择席别" }}</output><div class="choice-picker"><button v-for="seat in seatOptions" :key="seat" type="button" :class="{ selected: selectedSeatTypes(form.seatTypes).includes(seat) }" @click="form.seatTypes = toggleSeat(form.seatTypes, seat)">{{ seat }}</button></div></label></div>
+            <div class="fields two"><label>任务名称<input v-model="form.name" required placeholder="例如：国庆返程" /></label><label>任务优先级<select v-model.number="form.priority"><option v-for="priority in priorityOptions(form.priority)" :key="priority" :value="priority">{{ priority }}{{ priority === 1 ? "（最高）" : "" }}</option></select></label><label>乘车日期<DatePicker v-model="form.travelDate" label="乘车日期" :min-date="todayDate" @update:model-value="clearFormTrains" /></label><label>起售执行日期与时间<DatePicker v-model="form.saleTime" label="起售执行日期与时间" :min-date="todayDate" with-time with-seconds /><small>官方车站起售时刻只提供时、分；查询填入时秒默认为 00，可在此调整。</small></label><label>任务截止时间（可选）<DatePicker v-model="form.deadline" label="任务截止时间" :min-date="todayDate" with-time optional /><small>到时停止新查询，不会取消已生成订单。</small></label><label>出发站<StationPicker v-model="form.fromStation" :options="stationOptions" required aria-label="出发站" placeholder="输入车站名称搜索" @update:model-value="clearFormTrains" /></label><label>到达站<StationPicker v-model="form.toStation" :options="stationOptions" required aria-label="到达站" placeholder="输入车站名称搜索" @update:model-value="clearFormTrains" /></label><label>优先车次<button class="selection-output selection-trigger" type="button" :disabled="busy" @click="queryFormRoute">{{ form.trainCodes || "点击查询并选择车次" }}<span>查询</span></button></label><label>优先席别<output class="selection-output">{{ form.seatTypes || "请选择席别" }}</output><div class="choice-picker"><button v-for="seat in seatOptions" :key="seat" type="button" :class="{ selected: selectedSeatTypes(form.seatTypes).includes(seat) }" @click="form.seatTypes = toggleSeat(form.seatTypes, seat)">{{ seat }}</button></div></label></div>
             <div class="route-tools"><span v-if="stationsLoading">正在读取官方站点表…</span><template v-else-if="stationsError"><span class="field-hint">{{ stationsError }}</span><button type="button" class="quiet-action" @click="loadOfficialStations">重新加载车站</button></template></div>
             <div class="route-tools"><button class="quiet-action" type="button" @click="lookupSaleTime">查询发站官方起售时刻</button><button class="quiet-action" type="button" @click="lookupFormTrains">查询官网车次并选择</button><span v-if="saleTimeLookupMessage">{{ saleTimeLookupMessage }}</span><span v-if="formQueryMessage">{{ formQueryMessage }}</span></div>
             <div v-if="formQueryCandidates.length" class="train-picker" aria-label="选择优先车次"><button v-for="candidate in formQueryCandidates" :key="candidate.trainInternalRef" type="button" :class="{ selected: selectedTrainCodes(form.trainCodes).includes(candidate.trainCode) }" @click="form.trainCodes = toggleTrain(form.trainCodes, candidate.trainCode)"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }}–{{ candidate.arrivalTime }}</span><small>{{ seatSummary(candidate) }}</small></button></div>
             <div v-for="(route, index) in additionalRoutes" :key="route.id" class="route-draft">
               <div class="route-draft-head"><strong>备选路线 {{ index + 2 }}</strong><button class="danger-action" type="button" @click="removeRoute(index)">移除</button></div>
-              <div class="fields two"><label>路线优先级<select v-model.number="route.priority"><option v-for="priority in priorityOptions(route.priority)" :key="priority" :value="priority">{{ priority }}{{ priority === 1 ? "（最高）" : "" }}</option></select></label><label>乘车日期<DatePicker v-model="route.travelDate" label="备选路线乘车日期" :min-date="todayDate" @update:model-value="clearRouteTrains(route)" /></label><label>官方起售时间<DatePicker v-model="route.saleTime" label="备选路线官方起售时间" :min-date="todayDate" with-time /></label><label>出发站<StationPicker v-model="route.fromStation" :options="stationOptions" required :aria-label="`备选路线 ${index + 2} 出发站`" placeholder="输入车站名称搜索" @update:model-value="clearRouteTrains(route)" /></label><label>到达站<StationPicker v-model="route.toStation" :options="stationOptions" required :aria-label="`备选路线 ${index + 2} 到达站`" placeholder="输入车站名称搜索" @update:model-value="clearRouteTrains(route)" /></label><label>优先车次<button class="selection-output selection-trigger" type="button" :disabled="busy" @click="queryAdditionalRoute(route)">{{ route.trainCodes || "点击查询并选择车次" }}<span>查询</span></button></label><label>优先席别<output class="selection-output">{{ route.seatTypes || "请选择席别" }}</output><div class="choice-picker"><button v-for="seat in seatOptions" :key="`${route.id}-${seat}`" type="button" :class="{ selected: selectedSeatTypes(route.seatTypes).includes(seat) }" @click="route.seatTypes = toggleSeat(route.seatTypes, seat)">{{ seat }}</button></div></label></div>
+              <div class="fields two"><label>路线优先级<select v-model.number="route.priority"><option v-for="priority in priorityOptions(route.priority)" :key="priority" :value="priority">{{ priority }}{{ priority === 1 ? "（最高）" : "" }}</option></select></label><label>乘车日期<DatePicker v-model="route.travelDate" label="备选路线乘车日期" :min-date="todayDate" @update:model-value="clearRouteTrains(route)" /></label><label>起售执行时间<DatePicker v-model="route.saleTime" label="备选路线起售执行时间" :min-date="todayDate" with-time with-seconds /></label><label>出发站<StationPicker v-model="route.fromStation" :options="stationOptions" required :aria-label="`备选路线 ${index + 2} 出发站`" placeholder="输入车站名称搜索" @update:model-value="clearRouteTrains(route)" /></label><label>到达站<StationPicker v-model="route.toStation" :options="stationOptions" required :aria-label="`备选路线 ${index + 2} 到达站`" placeholder="输入车站名称搜索" @update:model-value="clearRouteTrains(route)" /></label><label>优先车次<button class="selection-output selection-trigger" type="button" :disabled="busy" @click="queryAdditionalRoute(route)">{{ route.trainCodes || "点击查询并选择车次" }}<span>查询</span></button></label><label>优先席别<output class="selection-output">{{ route.seatTypes || "请选择席别" }}</output><div class="choice-picker"><button v-for="seat in seatOptions" :key="`${route.id}-${seat}`" type="button" :class="{ selected: selectedSeatTypes(route.seatTypes).includes(seat) }" @click="route.seatTypes = toggleSeat(route.seatTypes, seat)">{{ seat }}</button></div></label></div>
               <div class="route-tools"><button class="quiet-action" type="button" @click="lookupRouteSaleTime(route)">查询该路线官方起售时刻</button><button class="quiet-action" type="button" @click="lookupRouteTrains(route)">查询官网车次并选择</button></div>
               <div v-if="routeQueryCandidates[route.id]?.length" class="train-picker" :aria-label="`选择备选路线 ${index + 2} 的优先车次`"><button v-for="candidate in routeQueryCandidates[route.id]" :key="candidate.trainInternalRef" type="button" :class="{ selected: selectedTrainCodes(route.trainCodes).includes(candidate.trainCode) }" @click="route.trainCodes = toggleTrain(route.trainCodes, candidate.trainCode)"><strong>{{ candidate.trainCode }}</strong><span>{{ candidate.departureTime }}–{{ candidate.arrivalTime }}</span><small>{{ seatSummary(candidate) }}</small></button></div>
             </div>

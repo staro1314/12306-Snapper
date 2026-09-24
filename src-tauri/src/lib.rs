@@ -254,6 +254,35 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_preserves_sale_time_seconds_through_serialization() {
+        let sale_time = chrono::DateTime::parse_from_rfc3339("2026-09-23T07:30:37Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task = TicketTask::new(
+            "second-precision".into(),
+            1,
+            false,
+            vec![passenger("p1", 1)],
+            vec![RouteGroup {
+                id: "route-1".into(),
+                travel_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                from_station: "北京南".into(),
+                to_station: "上海虹桥".into(),
+                sale_time,
+                priority: 1,
+                train_codes: vec!["G1".into()],
+                seat_types: vec!["二等座".into()],
+            }],
+            None,
+        ).unwrap();
+        task.status = TaskStatus::Armed;
+        let restored: TicketTask = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(restored.route_groups[0].sale_time, sale_time);
+        assert!(select_query_batch(&[restored.clone()], sale_time - Duration::seconds(1)).is_empty());
+        assert_eq!(select_query_batch(&[restored], sale_time).len(), 1);
+    }
+
+    #[test]
     fn restart_clears_only_obsolete_notification_gate_failures() {
         let database_path = std::env::temp_dir().join(format!("fast-12306-notification-gate-{}.db", uuid::Uuid::new_v4()));
         let task_id;
@@ -307,16 +336,32 @@ mod tests {
                 seat_types: vec!["二等座".into()],
             }], deadline: None,
         }).unwrap();
+        let mut live = state.subscribe_events();
         for message in ["第一条", "第二条", "第三条"] {
             state.record_execution_event(RecordExecutionEventInput {
                 task_id: task.id.clone(), route_group_id: None, stage: "TASK_START".into(),
                 outcome: "STARTED".into(), message: message.into(), duration_ms: None,
+                observed_at: None,
             }).unwrap();
         }
         let events = state.list_events(&task.id, Some(2)).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].message, "第三条");
         assert_eq!(events[1].message, "第二条");
+        for message in ["第一条", "第二条", "第三条"] {
+            let pushed = live.try_recv().unwrap();
+            assert_eq!(pushed.message, message);
+            assert_eq!(pushed.task_id, task.id);
+        }
+        let observed_at = Utc::now() - Duration::milliseconds(125);
+        let observed = state.record_execution_event(RecordExecutionEventInput {
+            task_id: task.id.clone(), route_group_id: Some("r1".into()),
+            stage: "OFFICIAL_QUERY".into(), outcome: "PASSED".into(),
+            message: "真实响应已观测".into(), duration_ms: Some(12.5),
+            observed_at: Some(observed_at),
+        }).unwrap();
+        assert_eq!(observed.created_at, observed_at);
+        assert_eq!(live.try_recv().unwrap().id, observed.id);
         drop(state);
         let _ = std::fs::remove_file(path);
     }

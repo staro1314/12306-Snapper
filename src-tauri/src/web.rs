@@ -1,13 +1,15 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use futures_util::{Stream, StreamExt, stream};
 use tower_http::cors::CorsLayer;
 
 use crate::{
@@ -78,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tasks/{task_id}/order/submitting", post(mark_order_submitting))
         .route("/api/tasks/{task_id}/rehearsal", post(run_rehearsal))
         .route("/api/tasks/{task_id}/events", get(list_events).post(record_execution_event))
+        .route("/api/events/stream", get(stream_events))
         .layer(CorsLayer::new())
         .with_state(state)
 }
@@ -143,6 +146,28 @@ async fn list_events(
     state.list_events(&task_id, query.limit).map(Json).map_err(ApiError)
 }
 async fn record_execution_event(State(state): State<Arc<AppState>>, Path(task_id): Path<String>, Json(mut input): Json<RecordExecutionEventInput>) -> Result<Json<ExecutionEvent>, ApiError> { input.task_id = task_id; state.record_execution_event(input).map(Json).map_err(ApiError) }
+
+/// Live, persisted execution events. SSE reconnects are paired with the existing history API;
+/// lagged broadcast messages are deliberately skipped here and recovered by the client.
+async fn stream_events(State(state): State<Arc<AppState>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.subscribe_events();
+    let events = stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let payload = Event::default().event("execution").json_data(event).ok()?;
+                    return Some((Ok(payload), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    // Flush the response immediately so the UI does not show a false ten-second
+    // "connecting" state while waiting for the first real execution event.
+    let connected = stream::once(async { Ok::<Event, Infallible>(Event::default().comment("connected")) });
+    Sse::new(connected.chain(events)).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
 
 pub async fn serve(database_path: PathBuf) -> Result<(), String> {
     let state = Arc::new(AppState::open(database_path)?);

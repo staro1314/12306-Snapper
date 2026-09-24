@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 
-const props = defineProps<{ modelValue: string; label: string; withTime?: boolean; optional?: boolean; minDate?: string }>();
+const props = defineProps<{ modelValue: string; label: string; withTime?: boolean; withSeconds?: boolean; optional?: boolean; minDate?: string }>();
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>();
 const open = ref(false);
 const month = ref(new Date().getMonth());
@@ -9,6 +9,7 @@ const year = ref(new Date().getFullYear());
 const selected = ref('');
 const hour = ref('00');
 const minute = ref('00');
+const second = ref('00');
 const pad = (value: number) => String(value).padStart(2, '0');
 const years = computed(() => Array.from({ length: 11 }, (_, index) => year.value - 5 + index));
 const days = computed(() => {
@@ -23,7 +24,7 @@ function show() {
   const value = props.modelValue;
   const date = value ? new Date(`${value.slice(0, 10)}T12:00:00`) : new Date();
   year.value = date.getFullYear(); month.value = date.getMonth();
-  selected.value = value.slice(0, 10); hour.value = value.slice(11, 13) || '00'; minute.value = value.slice(14, 16) || '00';
+  selected.value = value.slice(0, 10); hour.value = value.slice(11, 13) || '00'; minute.value = value.slice(14, 16) || '00'; second.value = value.slice(17, 19) || '00';
   open.value = !open.value;
 }
 function moveMonth(offset: number) {
@@ -37,7 +38,7 @@ function choose(value: string) {
 }
 function commit() {
   if (!selected.value) return;
-  emit('update:modelValue', selected.value + (props.withTime ? `T${hour.value}:${minute.value}` : ''));
+  emit('update:modelValue', selected.value + (props.withTime ? `T${hour.value}:${minute.value}${props.withSeconds ? `:${second.value}` : ''}` : ''));
   open.value = false;
 }
 </script>
@@ -64,6 +65,7 @@ function commit() {
       <div v-if="withTime" class="calendar-time">
         <span>时间</span><select v-model="hour" aria-label="小时"><option v-for="item in 24" :key="item" :value="pad(item - 1)">{{ pad(item - 1) }} 时</option></select>
         <select v-model="minute" aria-label="分钟"><option v-for="item in 60" :key="item" :value="pad(item - 1)">{{ pad(item - 1) }} 分</option></select>
+        <select v-if="withSeconds" v-model="second" aria-label="秒"><option v-for="item in 60" :key="item" :value="pad(item - 1)">{{ pad(item - 1) }} 秒</option></select>
         <button type="button" :disabled="!selected" @click="commit">确定</button>
       </div>
       <button v-if="optional" type="button" class="quiet-action" @click="emit('update:modelValue', ''); open = false">不设置截止时间</button>

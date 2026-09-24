@@ -64,6 +64,9 @@ pub struct RecordExecutionEventInput {
     pub outcome: String,
     pub message: String,
     pub duration_ms: Option<f64>,
+    /// Local action time, supplied by the browser observer. Omitted for Rust-owned events.
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 impl ExecutionEvent {
@@ -71,7 +74,7 @@ impl ExecutionEvent {
         Self {
             id: Uuid::new_v4().to_string(), task_id: input.task_id,
             source: "12306_OFFICIAL_RUNTIME".into(), stage: input.stage,
-            outcome: input.outcome, message: input.message, created_at: Utc::now(),
+            outcome: input.outcome, message: input.message, created_at: input.observed_at.unwrap_or_else(Utc::now),
             route_group_id: input.route_group_id, duration_ms: input.duration_ms,
         }
     }

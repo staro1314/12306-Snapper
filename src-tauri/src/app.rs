@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::broadcast;
 
 use crate::{
     domain::{
@@ -21,6 +22,7 @@ pub struct AppState {
     protocol: Arc<dyn RailwayProtocolAdapter>,
     pub submission_lock: Mutex<()>,
     runtime_heartbeat: RwLock<Option<chrono::DateTime<Utc>>>,
+    event_sender: broadcast::Sender<ExecutionEvent>,
 }
 
 impl AppState {
@@ -54,6 +56,7 @@ impl AppState {
             protocol: Arc::new(ObservedReadOnlyProtocolAdapter),
             submission_lock: Mutex::new(()),
             runtime_heartbeat: RwLock::new(None),
+            event_sender: broadcast::channel(512).0,
         })
     }
 
@@ -159,11 +162,19 @@ impl AppState {
         self.repository.lock().list_events(task_id, limit.unwrap_or(100).clamp(1, 500))
     }
 
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ExecutionEvent> {
+        self.event_sender.subscribe()
+    }
+
     pub fn record_execution_event(&self, input: RecordExecutionEventInput) -> Result<ExecutionEvent, String> {
         if !self.tasks.read().iter().any(|task| task.id == input.task_id) { return Err("任务不存在".into()); }
         if input.stage.len() > 64 || input.outcome.len() > 64 || input.message.len() > 240 { return Err("执行记录字段过长".into()); }
+        if input.observed_at.is_some_and(|at| (Utc::now() - at).num_seconds().abs() > 300) { return Err("执行记录时间超出允许范围".into()); }
         let event = ExecutionEvent::official_runtime(input);
         self.repository.lock().save_events(std::slice::from_ref(&event))?;
+        // Publish only after durable storage. A reconnecting client can recover missed events
+        // through list_events without mistaking an uncommitted event for a real operation.
+        let _ = self.event_sender.send(event.clone());
         Ok(event)
     }
 

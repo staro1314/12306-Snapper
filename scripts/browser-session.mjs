@@ -1,8 +1,12 @@
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright-core";
+import { ensurePassengerSelected, PASSENGER_RENDER_TIMEOUT_MS } from "./passenger-selection.mjs";
+import { createOfficialClockSample, estimateOfficialNow } from "./official-clock.mjs";
+import { isOfficialFinalConfirmReady, officialConfirmationMode } from "./official-final-confirm.mjs";
+import { captureOfficialQueryProfile, reusableOfficialQueryUrl } from "./official-query-profile.mjs";
 
 const host = "127.0.0.1";
 const port = 3211;
@@ -12,9 +16,8 @@ const loginUrl = "https://kyfw.12306.cn/otn/resources/login.html";
 const ORDER_CONFIRM_REQUEST_TIMEOUT_MS = 30_000;
 const ORDER_QUEUE_TIMEOUT_MS = 5 * 60_000;
 const ORDER_QUEUE_RESPONSE_TIMEOUT_MS = 35_000;
-// The observed protocol profile has completed a real pending-order acceptance run.
-// Real submission is therefore available by default, but every task still needs explicit
-// per-task authorization. Set the environment variable to 0 as an emergency kill switch.
+// Real submission requires explicit per-task authorization and can be disabled process-wide.
+// The complete real pending-order flow is not yet an acceptance claim for this build.
 const realSubmissionEnabled = process.env.FAST_12306_ENABLE_REAL_SUBMISSION !== "0";
 let context;
 let page;
@@ -32,11 +35,40 @@ let passengerSnapshot = [];
 const passengerSecrets = new Map();
 let officialClock = null;
 let latestQuery = null;
+let officialQueryProfile = null;
 let lastOfficialQueryStartedAt = 0;
 let securityState = null;
 let orderExecutionInProgress = false;
+let orderContextReservedUntil = 0;
 let orderQueueState = { status: "IDLE", orderRef: null, waitTime: null, confirmPath: null, queueAcceptedAt: null, queueAcceptedDurationMs: null, updatedAt: new Date().toISOString() };
 let status = { state: "idle", message: "尚未打开 12306 官方登录页", updatedAt: new Date().toISOString() };
+
+// Every automation endpoint uses the same persistent Playwright page. Serialize its reads and
+// mutations so concurrent route queries cannot race the shared form, latestQuery, or order DOM.
+let pageOperationTail = Promise.resolve();
+async function acquirePageOperation() {
+  const previous = pageOperationTail;
+  let release;
+  pageOperationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  return release;
+}
+
+const pageOperationRoutes = new Set([
+  "POST /start", "POST /logout", "GET /login/qr", "GET /stations", "POST /preflight",
+  "GET /observe/account-links", "GET /observe/confirmation-handler", "POST /observe/passengers-page", "POST /observe/search-page",
+  "POST /observe/query", "POST /observe/order-initialize", "GET /observe/order-endpoints",
+  "POST /observe/orders-page", "POST /orders/reconcile", "POST /orders/open",
+  "GET /observe/confirm-profile", "POST /observe/passenger-controls", "POST /observe/order-ready", "POST /order/execute",
+]);
+
+function isOrderContextReserved() {
+  if (orderContextReservedUntil <= Date.now()) {
+    orderContextReservedUntil = 0;
+    return false;
+  }
+  return true;
+}
 
 const seatOptionLabel = (label) => ({
   "商务座": "商务座", "特等座": "特等座", "一等座": "一等座", "二等座": "二等座",
@@ -50,15 +82,6 @@ const ticketTypeLabel = (passenger) => {
   return "成人票";
 };
 
-async function ensurePassengerSelected(targetPage, passenger) {
-  const label = targetPage.locator("label:visible").filter({ hasText: String(passenger.passenger_name) }).first();
-  if (!(await label.count())) throw new Error("确认页未找到所选乘车人");
-  const controlId = await label.getAttribute("for");
-  const checkbox = controlId ? targetPage.locator(`input[type="checkbox"][id="${controlId.replaceAll('"', '\\"')}"]`) : label.locator('input[type="checkbox"]');
-  if (!(await checkbox.count())) throw new Error("确认页乘车人控件结构不兼容");
-  if (!(await checkbox.isChecked())) await checkbox.click({ force: true });
-}
-
 async function updateStatus(state, message) {
   status = { state, message, updatedAt: new Date().toISOString() };
   await mkdir(path.dirname(statusFile), { recursive: true });
@@ -68,6 +91,7 @@ async function updateStatus(state, message) {
 async function inspectLoginState() {
   if (!page || page.isClosed()) return updateStatus("closed", "登录浏览器已关闭");
   try {
+    const clockRequestStartedAt = performance.now();
     const result = await page.evaluate(async () => {
       const visibleLogout = Boolean(document.querySelector("#J-header-logout, .header-logout"));
       try {
@@ -77,8 +101,9 @@ async function inspectLoginState() {
         return { visibleLogout, value, qrResultCode: typeof window.popup_s === "undefined" ? null : String(window.popup_s), nowStr: body?.data?.nowStr ?? null, nowValue: body?.data?.now ?? null, security: { isSweepLogin: body?.data?.is_sweep_login ?? null, isUamLogin: body?.data?.is_uam_login ?? null, isLoginPassCode: body?.data?.is_login_passCode ?? null, isMessagePassCode: body?.data?.is_message_passCode ?? null, isPhoneCheck: body?.data?.is_phone_check ?? null } };
       } catch { return { visibleLogout, value: null, qrResultCode: typeof window.popup_s === "undefined" ? null : String(window.popup_s) }; }
     });
+    const clockResponseReceivedAt = performance.now();
     const epochCandidate = Number(result.nowValue);
-    officialClock = { nowStr: typeof result.nowStr === "string" ? result.nowStr : officialClock?.nowStr ?? null, epochMs: Number.isFinite(epochCandidate) && epochCandidate > 1_000_000_000_000 ? epochCandidate : null };
+    officialClock = createOfficialClockSample(epochCandidate, clockRequestStartedAt, clockResponseReceivedAt);
     securityState = result.security;
     if (result.visibleLogout || result.value === "Y" || result.value === true) {
       authenticatedSessionObserved = true;
@@ -226,26 +251,7 @@ function attachReadOnlyObserver(targetPage) {
             isActive: [...new Set(body.data.datas.map((item) => String(item.is_active)))],
             passengerFlag: [...new Set(body.data.datas.map((item) => String(item.passenger_flag)))],
           };
-          passengerSnapshot = body.data.datas.map((item, index) => {
-            const identitySeed = item.passenger_uuid || item.allEncStr || `${item.passenger_name}:${item.passenger_id_no}`;
-            const name = String(item.passenger_name ?? "乘车人");
-            const typeName = String(item.passenger_type_name ?? "成人");
-            const passengerRef = `p_${createHash("sha256").update(String(identitySeed)).digest("hex").slice(0, 16)}`;
-            passengerSecrets.set(passengerRef, item);
-            return {
-              passengerRef,
-              displayName: `${Array.from(name)[0] ?? "乘"}${"*".repeat(Math.max(1, Array.from(name).length - 1))}`,
-              ticketType: typeName.includes("学生") ? "student" : typeName.includes("儿童") ? "child" : "adult",
-              ticketTypeLabel: typeName,
-              priority: index + 1,
-              // The authenticated passenger list is the source of truth for records that the
-              // official booking page can present. is_active is retained as an observation only:
-              // it is not equivalent to whether the passenger can be selected on the order page.
-              // The order preflight remains the final guard because it checks the live official form.
-              officialActive: item.is_active === true || item.is_active === "Y" || item.is_active === "1" || item.is_active === 1,
-              verified: true,
-            };
-          });
+          updatePassengerSnapshot(body.data.datas);
         }
         if (url.pathname === "/passport/web/checkqr") {
           const qrResultCode = String(body?.result_code ?? "");
@@ -258,6 +264,28 @@ function attachReadOnlyObserver(targetPage) {
       observations.push(entry);
       if (observations.length > 300) observations.splice(0, observations.length - 300);
     } catch { /* A failed metadata read must never interfere with the official page. */ }
+  });
+}
+
+function updatePassengerSnapshot(passengers) {
+  // Replace, do not merge, references from older logins or contact-list versions.
+  passengerSecrets.clear();
+  passengerSnapshot = passengers.map((item, index) => {
+    const identitySeed = item.passenger_uuid || item.allEncStr || `${item.passenger_name}:${item.passenger_id_no}`;
+    const name = String(item.passenger_name ?? "乘车人");
+    const typeName = String(item.passenger_type_name ?? "成人");
+    const passengerRef = `p_${createHash("sha256").update(String(identitySeed)).digest("hex").slice(0, 16)}`;
+    passengerSecrets.set(passengerRef, item);
+    return {
+      passengerRef,
+      displayName: `${Array.from(name)[0] ?? "乘"}${"*".repeat(Math.max(1, Array.from(name).length - 1))}`,
+      ticketType: typeName.includes("学生") ? "student" : typeName.includes("儿童") ? "child" : "adult",
+      ticketTypeLabel: typeName,
+      priority: index + 1,
+      // is_active is an observation, not proof the booking page will allow selection.
+      officialActive: item.is_active === true || item.is_active === "Y" || item.is_active === "1" || item.is_active === 1,
+      verified: true,
+    };
   });
 }
 
@@ -282,6 +310,7 @@ async function startBrowser({ headless = false } = {}) {
     await updateStatus("starting", headless ? "正在恢复后台 12306 会话" : "正在启动持久化 Chrome");
   }
   await mkdir(profileDir, { recursive: true });
+  officialQueryProfile = null;
   context = await chromium.launchPersistentContext(profileDir, {
     channel: "chrome",
     headless,
@@ -322,6 +351,8 @@ async function logoutBrowser() {
   if (polling) clearInterval(polling);
   polling = undefined;
   passengerSnapshot = [];
+  latestQuery = null;
+  officialQueryProfile = null;
   passengerSecrets.clear();
   authenticatedSessionObserved = false;
   if (context) {
@@ -352,40 +383,112 @@ function updateQueueState(patch) {
   return orderQueueState;
 }
 
-async function monitorOfficialQueue(confirmPath) {
+// Telemetry is best-effort and never awaited on the booking hot path. Only fixed, redacted
+// descriptions are sent; no token, cookie, raw official body, order number, or passenger data.
+function emitOrderTrace(trace, stage, outcome, message, durationMs, observedAt = new Date().toISOString()) {
+  if (!trace?.taskId || !trace?.routeGroupId) return;
+  void fetch(`http://127.0.0.1:3210/api/tasks/${encodeURIComponent(trace.taskId)}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ taskId: trace.taskId, routeGroupId: trace.routeGroupId, stage, outcome, message, durationMs, observedAt }),
+    signal: AbortSignal.timeout(1500),
+  }).catch(() => undefined);
+}
+
+async function findOfficialPendingOrder(passengerRefs, expectedOrderId = null) {
+  const passengerNames = passengerRefs.map((ref) => passengerSecrets.get(ref)?.passenger_name).filter(Boolean);
+  if (passengerNames.length !== passengerRefs.length) return null;
+  const rawOrderRef = await page.evaluate(async ({ passengerNames, expectedOrderId }) => {
+    try {
+      const officialResponse = await fetch("/otn/queryOrder/queryMyOrderNoComplete", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" },
+        body: "_json_att=",
+      });
+      const body = await officialResponse.json();
+      if (body?.status !== true) return null;
+      const orders = Array.isArray(body.data?.orderDBList) ? body.data.orderDBList : Array.isArray(body.data?.orders) ? body.data.orders : [];
+      const matching = orders.filter((order) => {
+        const orderId = String(order.sequence_no ?? order.order_id ?? order.orderId ?? "");
+        if (!orderId || (expectedOrderId && orderId !== String(expectedOrderId))) return false;
+        const tickets = Array.isArray(order.tickets) ? order.tickets : Array.isArray(order.ticketList) ? order.ticketList : [];
+        const names = tickets.map((ticket) => ticket.passengerDTO?.passenger_name ?? ticket.passenger_name).filter(Boolean);
+        return passengerNames.every((name) => names.includes(name));
+      });
+      return matching.length === 1 ? String(matching[0].sequence_no ?? matching[0].order_id ?? matching[0].orderId) : null;
+    } catch { return null; }
+  }, { passengerNames, expectedOrderId });
+  return rawOrderRef ? `o_${createHash("sha256").update(rawOrderRef).digest("hex").slice(0, 16)}` : null;
+}
+
+async function monitorOfficialQueue(confirmPath, trace, passengerRefs) {
   const deadline = Date.now() + ORDER_QUEUE_TIMEOUT_MS;
   let lastWaitTime = null;
+  let observedOrderId = null;
+  let lastProgressAt = 0;
   try {
     while (Date.now() < deadline) {
-      const waitResponse = await page.waitForResponse((candidate) => candidate.url().includes("/confirmPassenger/queryOrderWaitTime"), { timeout: Math.min(ORDER_QUEUE_RESPONSE_TIMEOUT_MS, deadline - Date.now()) }).catch(() => null);
-      if (!waitResponse) continue;
+      const nextWaitMs = lastWaitTime != null && lastWaitTime < 0 ? 15_000 : ORDER_QUEUE_RESPONSE_TIMEOUT_MS;
+      const waitResponse = await page.waitForResponse((candidate) => candidate.url().includes("/confirmPassenger/queryOrderWaitTime"), { timeout: Math.min(nextWaitMs, deadline - Date.now()) }).catch(() => null);
+      if (!waitResponse) {
+        if (lastWaitTime != null && lastWaitTime < 0) {
+          const pending = await findOfficialPendingOrder(passengerRefs, observedOrderId);
+          if (pending) {
+            emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "PAYMENT_PENDING", "排队等待指标为负后，官方未支付订单列表已核实本次订单");
+            return updateQueueState({ status: "PAYMENT_PENDING", orderRef: pending, waitTime: lastWaitTime, confirmPath });
+          }
+        }
+        emitOrderTrace(trace, "OFFICIAL_QUEUE", "WAITING", "本轮未观测到新的官方排队状态响应；仍在五分钟窗口内等待，不会重复提交");
+        continue;
+      }
       const waitBody = await waitResponse.json().catch(() => null);
       const orderId = waitBody?.data?.orderId;
       lastWaitTime = Number.isFinite(waitBody?.data?.waitTime) ? waitBody.data.waitTime : lastWaitTime;
       updateQueueState({ waitTime: lastWaitTime });
-      if (orderId) return updateQueueState({ status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(String(orderId)).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime, confirmPath });
-      if (lastWaitTime != null && lastWaitTime < 0) break;
+      if (orderId) {
+        observedOrderId = String(orderId);
+        emitOrderTrace(trace, "OFFICIAL_QUEUE", "ORDER_ID_RECEIVED", "官方排队响应返回订单标识；继续核对官方未支付订单列表");
+        let lastVerificationLogAt = 0;
+        while (Date.now() < deadline) {
+          const orderRef = await findOfficialPendingOrder(passengerRefs, orderId);
+          if (orderRef) {
+            emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "PAYMENT_PENDING", "官方未支付订单列表已核实本次订单");
+            return updateQueueState({ status: "PAYMENT_PENDING", orderRef, waitTime: lastWaitTime, confirmPath });
+          }
+          if (Date.now() - lastVerificationLogAt >= 30_000) {
+            emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "WAITING", "排队已返回订单标识，但官方未支付订单列表尚未确认；继续等待，不会重复提交");
+            lastVerificationLogAt = Date.now();
+          }
+          await page.waitForTimeout(Math.min(2000, deadline - Date.now()));
+        }
+        break;
+      }
+      if (Date.now() - lastProgressAt >= 5000) {
+        emitOrderTrace(trace, "OFFICIAL_QUEUE", "WAITING", lastWaitTime == null ? "收到官方排队状态响应，尚未返回订单标识" : `收到官方排队状态响应：等待指标 ${lastWaitTime}，尚未返回订单标识`);
+        lastProgressAt = Date.now();
+      }
+      // A negative waitTime is not proof of failure: 12306 may publish the
+      // unpaid order after this response. Keep observing through the window.
     }
+    emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "STARTED", "排队窗口结束或官方返回终止状态；开始只读核对未支付订单");
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (attempt > 0) await page.waitForTimeout(2000);
-      const pending = await page.evaluate(async () => {
-        try {
-          const officialResponse = await fetch("/otn/queryOrder/queryMyOrderNoComplete", { method: "POST", credentials: "include", headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" }, body: "_json_att=" });
-          const body = await officialResponse.json();
-          const orders = Array.isArray(body?.data?.orderDBList) ? body.data.orderDBList : Array.isArray(body?.data?.orders) ? body.data.orders : [];
-          const order = orders[0];
-          return body?.status === true && order ? String(order.sequence_no ?? order.order_id ?? order.orderId ?? "") : "";
-        } catch { return ""; }
-      });
-      if (pending) return updateQueueState({ status: "PAYMENT_PENDING", orderRef: `o_${createHash("sha256").update(pending).digest("hex").slice(0, 16)}`, waitTime: lastWaitTime, confirmPath });
+      const pending = await findOfficialPendingOrder(passengerRefs, observedOrderId);
+      if (pending) {
+        emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "PAYMENT_PENDING", "官方未支付订单列表已核实本次乘车人的订单");
+        return updateQueueState({ status: "PAYMENT_PENDING", orderRef: pending, waitTime: lastWaitTime, confirmPath });
+      }
     }
+    emitOrderTrace(trace, "OFFICIAL_RECONCILIATION", "UNKNOWN", "未在官方未支付订单查询中确认本次订单；停止后续提交");
     return updateQueueState({ status: "UNKNOWN", orderRef: null, waitTime: lastWaitTime, confirmPath });
   } catch (error) {
+    emitOrderTrace(trace, "OFFICIAL_QUEUE", "UNKNOWN", "排队监控发生异常；结果保持未知并等待查单");
     return updateQueueState({ status: "UNKNOWN", orderRef: null, waitTime: lastWaitTime, confirmPath, error: String(error?.message ?? error).slice(0, 160) });
   }
 }
 
 http.createServer(async (request, response) => {
+  let releasePageOperation;
   try {
     const hostHeader = String(request.headers.host ?? "").split(":")[0].replace(/^\[|\]$/g, "");
     if (!["127.0.0.1", "localhost", "::1"].includes(hostHeader)) return send(response, 403, { error: "仅允许本机访问浏览器会话服务" });
@@ -395,11 +498,27 @@ http.createServer(async (request, response) => {
       try { originHost = new URL(origin).hostname; } catch { return send(response, 403, { error: "请求来源无效" }); }
       if (!["127.0.0.1", "localhost", "::1"].includes(originHost)) return send(response, 403, { error: "拒绝非本机网页调用" });
     }
+    const requestPath = new URL(request.url, "http://127.0.0.1").pathname;
+    const routeKey = `${request.method} ${requestPath}`;
+    const isOrderExecution = routeKey === "POST /order/execute";
+    const isReservedContextObservation = routeKey === "POST /observe/passenger-controls" || routeKey === "POST /observe/order-ready";
+    if (pageOperationRoutes.has(routeKey)) {
+      releasePageOperation = await acquirePageOperation();
+      const orderInProgress = orderExecutionInProgress || orderQueueState.status === "QUEUING";
+      if ((orderInProgress || isOrderContextReserved()) && !isOrderExecution && !(isReservedContextObservation && !orderInProgress)) {
+        return send(response, 409, {
+          classification: "ORDER_EXECUTION_BUSY",
+          error: orderInProgress
+            ? "12306 订单正在提交或排队，已暂停其他浏览器操作以保护订单状态"
+            : "12306 订单确认上下文已预留，已暂停其他浏览器操作以防提交错车次",
+        });
+      }
+    }
     if (request.method === "GET" && request.url === "/status") return send(response, 200, status);
     if (request.method === "POST" && request.url === "/logout") return send(response, 200, await logoutBrowser());
     if (request.method === "GET" && request.url === "/capabilities") return send(response, 200, { queryEnabled: true, realSubmissionEnabled });
     if (request.method === "GET" && request.url === "/order/queue-status") return send(response, 200, { source: "12306_OFFICIAL", ...orderQueueState });
-    if (request.method === "GET" && request.url === "/official-clock") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", now: officialClock?.epochMs ?? officialClock?.nowStr ?? null });
+    if (request.method === "GET" && request.url === "/official-clock") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", now: estimateOfficialNow(officialClock, performance.now()) });
     if (request.method === "GET" && request.url === "/stations") {
       await ensureSearchPage();
       const stations = await page.evaluate(() => {
@@ -426,6 +545,7 @@ http.createServer(async (request, response) => {
       await inspectLoginState();
       if (status.state !== "logged_in") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "12306 登录状态无效" });
       if (!Array.isArray(input.passengerRefs) || !input.passengerRefs.length || input.passengerRefs.some((ref) => !passengerSecrets.get(ref))) return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "乘车人引用未同步或已失效" });
+      if (input.passengerRefs.some((ref) => !String(passengerSecrets.get(ref)?.passenger_name ?? "").trim())) return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "乘车人资料不完整，请重新同步" });
       if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "当前会话需要 App 或 UAM 核验" });
       const conflictCheck = await page.evaluate(async () => {
         try {
@@ -446,6 +566,24 @@ http.createServer(async (request, response) => {
     }
     if (request.method === "GET" && request.url === "/login/qr") return send(response, 200, await captureLoginQrCode());
     if (request.method === "GET" && request.url === "/observe/network") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", entries: observations });
+    if (request.method === "GET" && request.url === "/observe/confirmation-handler") {
+      if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
+      const inspection = await page.evaluate(async () => {
+        const scriptUrl = "https://kyfw.12306.cn/otn/resources/merged/passengerInfo_js.js";
+        const officialResponse = await fetch(scriptUrl, { credentials: "include" });
+        if (!officialResponse.ok) return { status: officialResponse.status, snippets: [] };
+        const source = await officialResponse.text();
+        const patterns = ["qr_submit_id", "confirmSingleForQueue", "getQueueCount", "var af=ae.data.isAsync"];
+        return {
+          status: officialResponse.status,
+          snippets: patterns.flatMap((pattern) => {
+            const index = source.indexOf(pattern);
+            return index < 0 ? [] : [{ pattern, text: source.slice(Math.max(0, index - 450), Math.min(source.length, index + (pattern === "var af=ae.data.isAsync" ? 2400 : 900))) }];
+          }),
+        };
+      });
+      return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", ...inspection });
+    }
     if (request.method === "GET" && request.url === "/passengers") return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", passengers: passengerSnapshot });
     if (request.method === "GET" && request.url === "/observe/account-links") {
       if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
@@ -460,10 +598,15 @@ http.createServer(async (request, response) => {
     if (request.method === "POST" && request.url === "/observe/passengers-page") {
       if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
       observations.length = 0;
+      passengerSecrets.clear();
+      passengerSnapshot = [];
       const passengerResponse = page.waitForResponse((candidate) => new URL(candidate.url()).pathname === "/otn/passengers/query", { timeout: 15000 }).catch(() => null);
       await page.goto("https://kyfw.12306.cn/otn/view/passengers.html", { waitUntil: "domcontentloaded" });
-      await passengerResponse;
-      await page.waitForTimeout(250);
+      const officialResponse = await passengerResponse;
+      if (!officialResponse) return send(response, 409, { classification: "INCOMPATIBLE", error: "本次未收到官方乘车人列表响应，不能使用旧同步结果" });
+      const body = await officialResponse.json().catch(() => null);
+      if (!officialResponse.ok() || !Array.isArray(body?.data?.datas)) return send(response, 409, { classification: "INCOMPATIBLE", error: "本次官方乘车人列表响应无法解析" });
+      updatePassengerSnapshot(body.data.datas);
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", page: "/otn/view/passengers.html", passengers: passengerSnapshot, entries: observations });
     }
     if (request.method === "POST" && request.url === "/observe/search-page") {
@@ -476,6 +619,8 @@ http.createServer(async (request, response) => {
       if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
       const input = await readJsonBody(request);
       if (![input.fromStation, input.toStation, input.travelDate].every((value) => typeof value === "string" && value.length > 0 && value.length < 40)) return send(response, 400, { error: "查询参数无效" });
+      // A failed new query must not leave an older train secret eligible for order init.
+      latestQuery = null;
       await ensureSearchPage();
       const stationCodes = await page.evaluate(({ fromStation, toStation }) => {
         const stationText = window.station_names;
@@ -492,37 +637,78 @@ http.createServer(async (request, response) => {
       }, { ...input, ...stationCodes });
       const remainingCooldown = 5100 - (Date.now() - lastOfficialQueryStartedAt);
       if (remainingCooldown > 0) await page.waitForTimeout(remainingCooldown);
-      const responsePromise = page.waitForResponse((candidate) => /\/otn\/leftTicket\/query/.test(new URL(candidate.url()).pathname), { timeout: 15000 });
-      lastOfficialQueryStartedAt = Date.now();
-      await page.locator("#query_ticket").click();
-      const apiResponse = await responsePromise;
+      const queryTrace = { taskId: input.taskId, routeGroupId: input.routeGroupId };
+      const isOfficialQuery = (candidate) => /\/otn\/leftTicket\/query/.test(new URL(candidate.url()).pathname);
+      const requestPromise = page.waitForRequest(isOfficialQuery, { timeout: 15000 })
+        .then((request) => ({ request, observedAt: Date.now() })).catch(() => null);
+      const responsePromise = page.waitForResponse(isOfficialQuery, { timeout: 15000 })
+        .then((officialResponse) => ({ officialResponse, observedAt: Date.now() })).catch(() => null);
+      const directQueryUrl = status.state === "logged_in" ? reusableOfficialQueryUrl(officialQueryProfile, input) : null;
+      // A failed direct response must not leave the same profile eligible for blind reuse.
+      if (directQueryUrl) officialQueryProfile = null;
+      const queryClickStartedAt = Date.now();
+      lastOfficialQueryStartedAt = queryClickStartedAt;
+      emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "STARTED", directQueryUrl ? "正在通过已验证的当前会话请求官方余票" : "正在点击官方查询按钮；等待实际余票请求发出");
+      // A direct query is permitted only for the exact route/date request observed from this
+      // official page in this browser session. All other queries use the official button.
+      if (directQueryUrl) {
+        await page.evaluate(async (url) => {
+          await fetch(url, { method: "GET", credentials: "include", cache: "no-store", headers: { "X-Requested-With": "XMLHttpRequest" } });
+        }, directQueryUrl);
+      } else {
+        // Observers are armed before clicking; do not await unrelated navigation.
+        await page.locator("#query_ticket").click({ noWaitAfter: true });
+      }
+      const queryClickAwaitMs = Date.now() - queryClickStartedAt;
+      const queryRequest = await requestPromise;
+      if (queryRequest) {
+        lastOfficialQueryStartedAt = queryRequest.observedAt;
+        emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "REQUEST_SENT", "已观察到官方余票查询请求", queryRequest.observedAt - queryClickStartedAt, new Date(queryRequest.observedAt).toISOString());
+      }
+      const observedQueryResponse = await responsePromise;
+      const apiResponse = observedQueryResponse?.officialResponse ?? null;
+      if (!apiResponse) {
+        emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "UNKNOWN", "15 秒内未观测到 12306 余票接口响应，本轮停止解析", Date.now() - lastOfficialQueryStartedAt);
+        return send(response, 409, { classification: "QUERY_RESPONSE_UNKNOWN", error: "官方余票接口响应未被观测到，本轮已停止" });
+      }
       if (apiResponse.status() >= 300 && apiResponse.status() < 400) {
+        emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "FAILED", `12306 余票接口返回 HTTP ${apiResponse.status()} 跳转，未解析余票`, Date.now() - lastOfficialQueryStartedAt);
         let redirectPath = "UNAVAILABLE";
         try { redirectPath = new URL(apiResponse.headers().location, apiResponse.url()).pathname; } catch { /* Return a safe classification without the raw Location value. */ }
         return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), compatible: false, classification: "QUERY_REDIRECTED", redirectPath });
       }
-      if (!(apiResponse.headers()["content-type"] ?? "").includes("json")) return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), compatible: false, classification: "UNEXPECTED_CONTENT_TYPE" });
+      if (!(apiResponse.headers()["content-type"] ?? "").includes("json")) {
+        emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "FAILED", `12306 余票接口返回 HTTP ${apiResponse.status()}，响应不是 JSON`, Date.now() - lastOfficialQueryStartedAt);
+        return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), compatible: false, classification: "UNEXPECTED_CONTENT_TYPE" });
+      }
       const body = await apiResponse.json();
       const rows = Array.isArray(body?.data?.result) ? body.data.result : [];
       if (body?.status !== true) {
         const safeText = JSON.stringify(body?.messages ?? body?.validateMessagesShowId ?? "");
         const classification = /频繁|稍后|busy|rate/i.test(safeText) ? "RATE_LIMITED" : /登录|验证|login|uam/i.test(safeText) ? "USER_ACTION_REQUIRED" : "INCOMPATIBLE";
+        emitOrderTrace(queryTrace, "OFFICIAL_QUERY", classification, `12306 余票接口返回 HTTP ${apiResponse.status()}，未接受本轮查询`, Date.now() - lastOfficialQueryStartedAt);
         return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), success: false, compatible: false, classification });
       }
-      latestQuery = { input, candidates: rows.map(parseTicketCandidate) };
-      const result = { path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), responseKeys: Object.keys(body).sort(), dataKeys: body?.data && typeof body.data === "object" ? Object.keys(body.data).sort() : [], resultCount: rows.length, stationMapCount: body?.data?.map && typeof body.data.map === "object" ? Object.keys(body.data.map).length : null, success: body?.status === true, candidates: latestQuery.candidates.map(publicTicketCandidate) };
+      emitOrderTrace(queryTrace, "OFFICIAL_QUERY", "PASSED", `12306 余票接口返回 HTTP ${apiResponse.status()}，解析到 ${rows.length} 个车次`, Date.now() - lastOfficialQueryStartedAt);
+      officialQueryProfile = captureOfficialQueryProfile(queryRequest?.request, input, stationCodes);
+      latestQuery = { queryId: randomUUID(), input, candidates: rows.map(parseTicketCandidate) };
+      const result = { path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), queryMode: directQueryUrl ? "OBSERVED_DIRECT_REQUEST" : "OFFICIAL_PAGE_CLICK", responseKeys: Object.keys(body).sort(), dataKeys: body?.data && typeof body.data === "object" ? Object.keys(body.data).sort() : [], resultCount: rows.length, stationMapCount: body?.data?.map && typeof body.data.map === "object" ? Object.keys(body.data.map).length : null, queryId: latestQuery.queryId, success: body?.status === true, queryClickAwaitMs, queryRequestDelayMs: queryRequest ? queryRequest.observedAt - queryClickStartedAt : null, queryResponseRttMs: queryRequest ? observedQueryResponse.observedAt - queryRequest.observedAt : null, candidates: latestQuery.candidates.map(publicTicketCandidate) };
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", ...result });
     }
     if (request.method === "POST" && request.url === "/observe/order-initialize") {
       if (!page || page.isClosed() || !latestQuery) return send(response, 409, { error: "请先完成一次余票查询" });
       const input = await readJsonBody(request);
-      if (input.confirmObservation !== true || typeof input.trainCode !== "string") return send(response, 400, { error: "订单初始化观测参数无效" });
+      if (input.confirmObservation !== true || typeof input.trainCode !== "string" || typeof input.queryId !== "string") return send(response, 400, { error: "订单初始化参数缺少当前查询凭据" });
+      if (input.queryId !== latestQuery.queryId) return send(response, 409, { classification: "STALE_QUERY_CONTEXT", error: "查询结果已被更新，已阻止使用旧余票信息提交" });
       const train = latestQuery.candidates.find((candidate) => candidate.trainCode === input.trainCode && candidate.canBook);
       if (!train) return send(response, 409, { error: "最近查询中没有该可预订车次" });
+      const initializationTrace = { taskId: input.taskId, routeGroupId: input.routeGroupId };
       observations.length = 0;
       // Do not click the rendered train row. That path waits for table event handlers and a
       // browser redirect. Submit the exact secret from the immediately preceding official query,
       // then load the official confirmation page only after 12306 accepts initialization.
+      const initializationStartedAt = Date.now();
+      emitOrderTrace(initializationTrace, "OFFICIAL_INIT", "STARTED", `正在向 12306 初始化 ${input.trainCode} 的订单；尚未生成订单`);
       const initialization = await page.evaluate(async ({ secretStr, query }) => {
         const readValue = (selector, fallback) => document.querySelector(selector)?.value || fallback;
         const body = new URLSearchParams({
@@ -543,10 +729,19 @@ http.createServer(async (request, response) => {
         const payload = await officialResponse.json().catch(() => null);
         return { status: officialResponse.status, accepted: payload?.status === true, message: String(payload?.messages?.[0] ?? payload?.validateMessages?.[0] ?? "").replace(/\s+/g, " ").slice(0, 160) };
       }, { secretStr: train.secretStr, query: latestQuery.input });
-      if (!initialization.accepted) return send(response, 409, { classification: "ORDER_INITIALIZATION_REJECTED", error: initialization.message ? `12306 订单初始化未通过：${initialization.message}` : "12306 订单初始化未通过" });
+      if (!initialization.accepted) {
+        emitOrderTrace(initializationTrace, "OFFICIAL_INIT", "FAILED", `12306 订单初始化返回 HTTP ${initialization.status}，未接受`, Date.now() - initializationStartedAt);
+        return send(response, 409, { classification: "ORDER_INITIALIZATION_REJECTED", error: initialization.message ? `12306 订单初始化未通过：${initialization.message}` : "12306 订单初始化未通过" });
+      }
+      emitOrderTrace(initializationTrace, "OFFICIAL_INIT", "PASSED", `12306 订单初始化返回 HTTP ${initialization.status} 并接受；正在进入官方确认页`, Date.now() - initializationStartedAt);
+      // The official initialization consumed this query's train secret; do not retain or replay it.
+      latestQuery = null;
       await page.goto("https://kyfw.12306.cn/otn/confirmPassenger/initDc", { waitUntil: "domcontentloaded", timeout: 15000 });
       const currentPath = new URL(page.url()).pathname;
       if (currentPath !== "/otn/confirmPassenger/initDc") return send(response, 409, { classification: "INCOMPATIBLE", error: "订单初始化后未进入官方确认页面" });
+      // Reserve the exact confirmation context until `/order/execute` consumes it. The lease
+      // bounds recovery if the Rust caller exits between the two requests.
+      orderContextReservedUntil = Date.now() + 60_000;
       return send(response, 200, { source: "12306_OFFICIAL_OBSERVATION", trainCode: input.trainCode, submitInitPath: "/otn/leftTicket/submitOrderRequest", submitInitStatus: initialization.status, currentPath, entries: observations });
     }
     if (request.method === "GET" && request.url === "/observe/order-endpoints") {
@@ -624,21 +819,76 @@ http.createServer(async (request, response) => {
       }));
       return send(response, 200, { source: "12306_OFFICIAL_OBSERVATION", ...profile });
     }
+    if (request.method === "POST" && request.url === "/observe/passenger-controls") {
+      if (!page || page.isClosed() || !new URL(page.url()).pathname.includes("/confirmPassenger/initDc")) return send(response, 409, { classification: "INCOMPATIBLE", error: "当前不在确认乘车人页面" });
+      const input = await readJsonBody(request);
+      const passenger = passengerSecrets.get(input.passengerRef);
+      if (!passenger) return send(response, 409, { classification: "PASSENGER_REFERENCE_INVALID", error: "乘车人引用已失效" });
+      const structure = await page.evaluate((passengerName) => {
+        const visible = (element) => Boolean(element.getClientRects().length);
+        const containsName = (element) => (element?.textContent ?? "").replace(/\s+/g, "").includes(passengerName.replace(/\s+/g, ""));
+        const labels = [...document.querySelectorAll("label")].filter(visible);
+        const matchingLabels = labels.filter(containsName);
+        const allCheckboxes = [...document.querySelectorAll('input[type="checkbox"]')];
+        const checkboxes = allCheckboxes.filter(visible);
+        const nameContexts = [];
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let textNode;
+        while ((textNode = walker.nextNode()) && nameContexts.length < 8) {
+          const parent = textNode.parentElement;
+          if (!parent || parent.closest("script,style") || !containsName(textNode)) continue;
+          const ancestors = [];
+          for (let element = parent; element && ancestors.length < 6; element = element.parentElement) {
+            ancestors.push({ tag: element.tagName, classes: String(element.className ?? "").slice(0, 80), idPattern: String(element.id ?? "").replace(/\d/g, "#").slice(0, 80), checkboxCount: element.querySelectorAll('input[type="checkbox"]').length, radioCount: element.querySelectorAll('input[type="radio"]').length, role: element.getAttribute("role") });
+          }
+          nameContexts.push(ancestors);
+        }
+        return {
+          bodyContainsName: containsName(document.body),
+          visibleLabelCount: labels.length,
+          matchingLabelCount: matchingLabels.length,
+          matchingLabelWithCheckboxCount: matchingLabels.filter((label) => label.querySelector('input[type="checkbox"]') || (label.htmlFor && document.getElementById(label.htmlFor)?.matches('input[type="checkbox"]'))).length,
+          allCheckboxCount: allCheckboxes.length,
+          allRadioCount: document.querySelectorAll('input[type="radio"]').length,
+          visibleCheckboxCount: checkboxes.length,
+          nameContexts,
+          checkboxContexts: checkboxes.slice(0, 20).map((checkbox) => ({
+            checked: checkbox.checked,
+            labelContainsName: containsName(checkbox.closest("label")),
+            parentContainsName: containsName(checkbox.parentElement),
+            grandparentContainsName: containsName(checkbox.parentElement?.parentElement),
+            parentTag: checkbox.parentElement?.tagName ?? null,
+            grandparentTag: checkbox.parentElement?.parentElement?.tagName ?? null,
+            parentClasses: String(checkbox.parentElement?.className ?? "").slice(0, 80),
+          })),
+        };
+      }, String(passenger.passenger_name ?? ""));
+      return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", structure });
+    }
     if (request.method === "POST" && request.url === "/observe/order-ready") {
       if (!page || page.isClosed() || !new URL(page.url()).pathname.includes("/confirmPassenger/initDc")) return send(response, 409, { classification: "INCOMPATIBLE", error: "当前不在确认乘车人页面" });
       const input = await readJsonBody(request);
       if (!Array.isArray(input.passengerRefs) || !input.passengerRefs.length || typeof input.seatTypeLabel !== "string") return send(response, 400, { error: "订单就绪校验需要乘车人和席别" });
-      if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "当前会话需要重新完成 App 或 UAM 核验" });
-      const tokenPresent = await page.evaluate(() => typeof window.globalRepeatSubmitToken === "string" && window.globalRepeatSubmitToken.length > 10);
-      if (!tokenPresent) return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页动态令牌缺失" });
+      if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", submissionAttempted: false, error: "当前会话需要重新完成 App 或 UAM 核验" });
+      try {
+        await page.waitForFunction(() => typeof window.globalRepeatSubmitToken === "string" && window.globalRepeatSubmitToken.length > 10, null, { timeout: PASSENGER_RENDER_TIMEOUT_MS });
+      } catch {
+        return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页动态令牌未就绪，已停止提交" });
+      }
       for (const passengerRef of input.passengerRefs) {
         const passenger = passengerSecrets.get(passengerRef);
         if (!passenger) return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "乘车人引用已失效，请重新同步" });
         try { await ensurePassengerSelected(page, passenger); }
-        catch { return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页未找到所选乘车人" }); }
+        catch (error) { return send(response, 409, { classification: error.classification ?? "INCOMPATIBLE", error: error.message }); }
       }
       const seatSelect = page.locator('select[id^="seatType_"]');
       const ticketTypeSelect = page.locator('select[name="confirmTicketType"]');
+      try {
+        await seatSelect.first().waitFor({ state: "attached", timeout: PASSENGER_RENDER_TIMEOUT_MS });
+        await ticketTypeSelect.first().waitFor({ state: "attached", timeout: PASSENGER_RENDER_TIMEOUT_MS });
+      } catch {
+        return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页席别或票种选择器未就绪，已停止提交" });
+      }
       if ((await seatSelect.count()) < input.passengerRefs.length || (await ticketTypeSelect.count()) < input.passengerRefs.length) return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页席别或票种选择器数量与乘车人不一致" });
       const seatSupported = await seatSelect.first().locator("option").evaluateAll((options, expected) => options.some((option) => option.textContent?.trim().includes(expected)), seatOptionLabel(input.seatTypeLabel));
       if (!seatSupported) return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页不支持所选席别" });
@@ -650,41 +900,65 @@ http.createServer(async (request, response) => {
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", compatible: true, tokenPresent: true, passengerCount: input.passengerRefs.length, seatSupported: true });
     }
     if (request.method === "POST" && request.url === "/order/execute") {
-      if (!realSubmissionEnabled) return send(response, 423, { error: "真实提交环境门禁未启用" });
-      if (orderExecutionInProgress || orderQueueState.status === "QUEUING") return send(response, 409, { classification: "ORDER_EXECUTION_BUSY", error: "已有订单正在提交或排队，账号级提交锁已拒绝并发执行" });
-      if (!page || page.isClosed() || !new URL(page.url()).pathname.includes("/confirmPassenger/initDc")) return send(response, 409, { error: "当前不在确认乘车人页面" });
+      if (!realSubmissionEnabled) return send(response, 423, { submissionAttempted: false, error: "真实提交环境门禁未启用" });
+      if (orderExecutionInProgress || orderQueueState.status === "QUEUING") return send(response, 409, { classification: "ORDER_EXECUTION_BUSY", submissionAttempted: false, error: "已有订单正在提交或排队，账号级提交锁已拒绝并发执行" });
+      if (!isOrderContextReserved()) return send(response, 409, { classification: "STALE_QUERY_CONTEXT", submissionAttempted: false, error: "订单确认上下文未预留或已过期，已停止提交" });
+      if (!page || page.isClosed() || !new URL(page.url()).pathname.includes("/confirmPassenger/initDc")) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "当前不在确认乘车人页面" });
       const input = await readJsonBody(request);
-      if (input.confirmRealSubmission !== true || !Array.isArray(input.passengerRefs) || !input.passengerRefs.length || typeof input.seatTypeLabel !== "string") return send(response, 400, { error: "真实提交需要明确确认、乘车人和席别" });
-      if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "当前会话需要重新完成 App 或 UAM 核验" });
+      if (input.confirmRealSubmission !== true || !Array.isArray(input.passengerRefs) || !input.passengerRefs.length || typeof input.seatTypeLabel !== "string") return send(response, 400, { submissionAttempted: false, error: "真实提交需要明确确认、乘车人和席别" });
+      if (!securityState || securityState.isSweepLogin !== "Y" || securityState.isUamLogin !== "Y") return send(response, 409, { classification: "USER_ACTION_REQUIRED", submissionAttempted: false, error: "当前会话需要重新完成 App 或 UAM 核验" });
+      const trace = { taskId: input.taskId, routeGroupId: input.routeGroupId };
       orderExecutionInProgress = true;
       updateQueueState({ status: "IDLE", orderRef: null, waitTime: null, confirmPath: null, queueAcceptedAt: null, queueAcceptedDurationMs: null, error: null });
+      let submissionAttempted = false;
       try {
+        emitOrderTrace(trace, "OFFICIAL_FORM", "STARTED", `官方确认页开始校验 ${input.passengerRefs.length} 名乘车人与 ${input.seatTypeLabel}；尚未提交订单`);
         for (const passengerRef of input.passengerRefs) {
           const passenger = passengerSecrets.get(passengerRef);
-          if (!passenger) return send(response, 409, { error: "乘车人引用已失效，请重新同步" });
+          if (!passenger) return send(response, 409, { classification: "PASSENGER_REFERENCE_INVALID", submissionAttempted: false, error: "乘车人引用已失效，请重新同步" });
           try { await ensurePassengerSelected(page, passenger); }
-          catch { return send(response, 409, { error: "确认页未找到所选乘车人" }); }
+          catch (error) {
+            emitOrderTrace(trace, "OFFICIAL_FORM", error.classification ?? "INCOMPATIBLE", error.message);
+            return send(response, 409, { classification: error.classification ?? "INCOMPATIBLE", submissionAttempted: false, error: error.message });
+          }
       }
       const seatSelect = page.locator('select[id^="seatType_"]');
       const ticketTypeSelect = page.locator('select[name="confirmTicketType"]');
+      try {
+        await seatSelect.first().waitFor({ state: "attached", timeout: PASSENGER_RENDER_TIMEOUT_MS });
+        await ticketTypeSelect.first().waitFor({ state: "attached", timeout: PASSENGER_RENDER_TIMEOUT_MS });
+      } catch {
+        return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "确认页席别或票种选择器未就绪，已停止提交" });
+      }
       const seatSelectCount = await seatSelect.count();
-      if (seatSelectCount < input.passengerRefs.length || (await ticketTypeSelect.count()) < input.passengerRefs.length) return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页席别或票种选择器数量与乘车人不一致" });
+      if (seatSelectCount < input.passengerRefs.length || (await ticketTypeSelect.count()) < input.passengerRefs.length) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "确认页席别或票种选择器数量与乘车人不一致" });
       const seatOption = await seatSelect.first().locator("option").evaluateAll((options, expected) => options.map((option) => ({ value: option.value, text: option.textContent?.trim() ?? "" })).find((option) => option.text.includes(expected)), seatOptionLabel(input.seatTypeLabel));
-      if (!seatOption) return send(response, 409, { error: "确认页不支持所选席别" });
+      if (!seatOption) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "确认页不支持所选席别" });
       for (let index = 0; index < input.passengerRefs.length; index += 1) {
         await seatSelect.nth(index).selectOption(seatOption.value);
         const passenger = passengerSecrets.get(input.passengerRefs[index]);
         const expectedTicketType = ticketTypeLabel(passenger);
         const ticketOption = await ticketTypeSelect.nth(index).locator("option").evaluateAll((options, expected) => options.map((option) => ({ value: option.value, text: option.textContent?.trim() ?? "" })).find((option) => option.text.includes(expected)), expectedTicketType);
-        if (!ticketOption) return send(response, 409, { classification: "INCOMPATIBLE", error: "确认页不支持乘车人的票种" });
+        if (!ticketOption) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "确认页不支持乘车人的票种" });
         await ticketTypeSelect.nth(index).selectOption(ticketOption.value);
       }
+        emitOrderTrace(trace, "OFFICIAL_FORM", "PASSED", "乘车人、席别和票种已在官方确认页选定；准备触发官方订单预检查");
+        const checkStartedAt = Date.now();
         const checkPromise = page.waitForResponse((candidate) => candidate.url().includes("/confirmPassenger/checkOrderInfo"), { timeout: 15000 }).catch(() => null);
+        emitOrderTrace(trace, "OFFICIAL_CHECK", "STARTED", "正在点击官方提交入口并等待 checkOrderInfo 响应；此时尚未进入排队");
         await page.locator("#submitOrder_id").click();
         const checkResponse = await checkPromise;
         const checkBody = checkResponse ? await checkResponse.json().catch(() => null) : null;
         const finalButton = page.locator("#qr_submit_id");
-        if (checkBody && checkBody?.data?.submitStatus !== true) return send(response, 409, { classification: "ORDER_CHECK_REJECTED", error: "官方订单预检查未通过" });
+        if (!checkBody) {
+          emitOrderTrace(trace, "OFFICIAL_CHECK", "UNKNOWN", "未确认收到官方订单预检查响应，已停止最终确认", Date.now() - checkStartedAt);
+          return send(response, 409, { classification: "ORDER_CHECK_UNKNOWN", submissionAttempted: false, error: "官方订单预检查结果未知，未点击最终确认" });
+        }
+        if (checkBody?.data?.submitStatus !== true) {
+          emitOrderTrace(trace, "OFFICIAL_CHECK", "FAILED", "官方订单预检查未通过，未点击最终确认", Date.now() - checkStartedAt);
+          return send(response, 409, { classification: "ORDER_CHECK_REJECTED", submissionAttempted: false, error: "官方订单预检查未通过" });
+        }
+        emitOrderTrace(trace, "OFFICIAL_CHECK", "PASSED", "官方 checkOrderInfo 响应表示预检查通过；等待最终确认控件", Date.now() - checkStartedAt);
         let finalVisible = await finalButton.isVisible().catch(() => false);
         if (!finalVisible) {
           const knownNotice = page.locator('.dhtmlx_window_active').filter({ hasText: "购买往返优惠票的旅客" }).filter({ hasText: "是否继续" });
@@ -699,7 +973,7 @@ http.createServer(async (request, response) => {
           }
           if (!finalVisible && noticeVisible) {
             const noticeConfirm = knownNotice.locator('button,input[type="button"],a').filter({ hasText: "确认" }).last();
-            if (!(await noticeConfirm.isVisible().catch(() => false))) return send(response, 409, { classification: "INCOMPATIBLE", error: "官方优惠票提示缺少可识别的确认按钮" });
+            if (!(await noticeConfirm.isVisible().catch(() => false))) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "官方优惠票提示缺少可识别的确认按钮" });
             await noticeConfirm.click();
           }
           if (!finalVisible) {
@@ -709,46 +983,80 @@ http.createServer(async (request, response) => {
                 const candidates = Array.from(document.querySelectorAll('.dhtmlx_window_active,.up-box')).filter((element) => { const style = getComputedStyle(element); return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0; });
                 return candidates.map((element) => ({ text: (element.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 220), buttons: Array.from(element.querySelectorAll('button,input[type="button"],a')).filter((button) => { const style = getComputedStyle(button); return style.display !== 'none' && style.visibility !== 'hidden' && button.getClientRects().length > 0; }).map((button) => `${button.id || '-'}:${(button.textContent || button.value || '').trim().replace(/\s+/g, ' ').slice(0, 40)}`).filter(Boolean).slice(0, 8) })).slice(0, 3);
               });
-              return send(response, 409, { classification: "INCOMPATIBLE", error: `官方订单核对弹窗未出现：${JSON.stringify(activeDialog)}` });
+              return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: `官方订单核对弹窗未出现：${JSON.stringify(activeDialog)}` });
             }
           }
           finalVisible = true;
         }
-        if (!finalVisible) return send(response, 409, { classification: "INCOMPATIBLE", error: "官方订单核对弹窗未出现" });
-        const enableDeadline = Date.now() + 2000;
-        while (Date.now() < enableDeadline && !(await finalButton.isEnabled().catch(() => false))) await page.waitForTimeout(20);
-        if (!(await finalButton.isEnabled().catch(() => false))) return send(response, 409, { classification: "ORDER_CONFIRM_NOT_READY", error: "官方确认按钮在 2 秒内未就绪" });
-        // Confirmation and queueing are separate phases. First prove that the final click
-        // actually produced the official confirmation request; only an accepted response
-        // is allowed to enter the five-minute queue window.
-        const confirmPromise = page.waitForResponse((candidate) => {
+        if (!finalVisible) return send(response, 409, { classification: "INCOMPATIBLE", submissionAttempted: false, error: "官方订单核对弹窗未出现" });
+        // The current official page leaves this button DOM-enabled during its countdown.
+        // Its own script binds qr_submitClickEvent only when it changes btn92 to btn92s.
+        // Clicking earlier is a no-op, as the observed 19:30 attempt demonstrated.
+        const confirmReadyStartedAt = Date.now();
+        const confirmReady = await page.waitForFunction(isOfficialFinalConfirmReady, null, { timeout: 15_000 }).then(() => true).catch(() => false);
+        if (!confirmReady) {
+          emitOrderTrace(trace, "OFFICIAL_CONFIRM", "NOT_READY", "官方最终确认按钮的点击处理尚未绑定，已停止且未点击最终确认", Date.now() - confirmReadyStartedAt);
+          return send(response, 409, { classification: "ORDER_CONFIRM_NOT_READY", submissionAttempted: false, error: "官方最终确认按钮尚未完成倒计时或绑定点击处理，未提交订单" });
+        }
+        const isFinalSubmission = (candidate) => {
           const parsed = new URL(candidate.url());
-          return candidate.request().method() === "POST"
-            && parsed.pathname.startsWith("/otn/confirmPassenger/")
-            && !/checkOrderInfo|getQueueCount|queryOrderWaitTime/i.test(parsed.pathname)
-            && /confirm|queue/i.test(parsed.pathname);
-        }, { timeout: ORDER_CONFIRM_REQUEST_TIMEOUT_MS }).catch(() => null);
+          return candidate.method() === "POST"
+            && /^\/otn\/confirmPassenger\/confirm(?:Single|Go|Back|Resign)ForQueue$/.test(parsed.pathname);
+        };
+        // Observe the request, not merely its response. A missing response can mean the
+        // request was sent and must be reconciled; a missing request is a different failure.
+        const requestPromise = page.waitForRequest(isFinalSubmission, { timeout: 5000 })
+          .then((request) => ({ request, observedAt: Date.now() })).catch(() => null);
+        const responsePromise = page.waitForResponse((candidate) => isFinalSubmission(candidate.request()), { timeout: ORDER_CONFIRM_REQUEST_TIMEOUT_MS })
+          .then((officialResponse) => ({ officialResponse, observedAt: Date.now() })).catch(() => null);
         const finalClickStartedAt = Date.now();
-        await finalButton.click();
-        const confirmResponse = await confirmPromise;
-        if (!confirmResponse) return send(response, 409, { classification: "ORDER_CONFIRM_NOT_SENT", error: "点击最终确认后 30 秒内未观察到 12306 排队请求，未进入排队阶段" });
+        emitOrderTrace(trace, "OFFICIAL_CONFIRM", "STARTED", "官方最终确认按钮已绑定，正在点击并观察最终提交请求；尚未证明已生成订单");
+        submissionAttempted = true;
+        await finalButton.click({ noWaitAfter: true });
+        const confirmRequest = await requestPromise;
+        if (!confirmRequest) {
+          emitOrderTrace(trace, "OFFICIAL_CONFIRM", "REQUEST_NOT_OBSERVED", "点击最终确认后未观察到已知提交请求；必须核对官方订单，不能盲目重提", Date.now() - finalClickStartedAt);
+          return send(response, 409, { classification: "ORDER_CONFIRM_NOT_OBSERVED", submissionAttempted: true, error: "点击最终确认后未观察到已知提交请求；已停止重提并核对官方订单" });
+        }
+        emitOrderTrace(trace, "OFFICIAL_CONFIRM", "REQUEST_SENT", "已观察到 12306 最终提交请求，等待官方响应；尚未证明生成订单", confirmRequest.observedAt - finalClickStartedAt, new Date(confirmRequest.observedAt).toISOString());
+        const observedConfirmResponse = await responsePromise;
+        const confirmResponse = observedConfirmResponse?.officialResponse ?? null;
+        if (!confirmResponse) {
+          emitOrderTrace(trace, "OFFICIAL_CONFIRM", "UNKNOWN", "最终提交请求已发出但未收到官方响应，必须先核对订单", Date.now() - finalClickStartedAt);
+          return send(response, 409, { classification: "ORDER_CONFIRM_RESPONSE_UNKNOWN", submissionAttempted: true, error: "最终提交请求已发出，但官方响应未知；已停止重提并核对订单" });
+        }
         const confirmPath = new URL(confirmResponse.url()).pathname;
+        const confirmDurationMs = observedConfirmResponse.observedAt - finalClickStartedAt;
         const confirmBody = await confirmResponse.json().catch(() => null);
-        if (confirmBody?.data?.submitStatus !== true) {
+        const confirmationMode = officialConfirmationMode(confirmBody);
+        if (confirmationMode === "REJECTED") {
+          emitOrderTrace(trace, "OFFICIAL_CONFIRM", "FAILED", "已收到官方最终确认响应，但未被接受进入排队", confirmDurationMs);
           const officialMessage = String(confirmBody?.data?.errMsg ?? confirmBody?.messages?.[0] ?? confirmBody?.validateMessages?.[0] ?? "").replace(/\s+/g, " ").slice(0, 160);
           return send(response, 409, { classification: "QUEUE_CONFIRM_REJECTED", error: officialMessage ? `12306 排队确认未通过：${officialMessage}` : "12306 排队确认未通过", confirmPath });
         }
-        const accepted = updateQueueState({ status: "QUEUING", orderRef: null, waitTime: null, confirmPath, queueAcceptedAt: new Date().toISOString(), queueAcceptedDurationMs: Date.now() - finalClickStartedAt });
-        void monitorOfficialQueue(confirmPath);
+        if (confirmationMode === "DIRECT") {
+          emitOrderTrace(trace, "OFFICIAL_CONFIRM", "DIRECT_ACCEPTED", "官方最终确认已接受并进入直接处理分支；正在核对真实待支付订单", confirmDurationMs);
+          return send(response, 200, { source: "12306_OFFICIAL", status: "DIRECT_ACCEPTED", confirmPath, queueAcceptedDurationMs: confirmDurationMs });
+        }
+        emitOrderTrace(trace, "OFFICIAL_CONFIRM", "QUEUING", "官方最终确认已接受异步排队；开始等待排队结果", confirmDurationMs);
+        const accepted = updateQueueState({ status: "QUEUING", orderRef: null, waitTime: null, confirmPath, queueAcceptedAt: new Date(observedConfirmResponse.observedAt).toISOString(), queueAcceptedDurationMs: confirmDurationMs });
+        void monitorOfficialQueue(confirmPath, trace, input.passengerRefs);
         return send(response, 200, { source: "12306_OFFICIAL", ...accepted });
+      } catch (error) {
+        const classification = submissionAttempted ? "UNKNOWN_RECONCILING" : "INCOMPATIBLE";
+        emitOrderTrace(trace, "OFFICIAL_FORM", classification, submissionAttempted ? "最终确认已点击但后续操作异常，必须核对订单" : "确认页操作异常，尚未点击最终确认");
+        return send(response, 409, { classification, submissionAttempted, error: submissionAttempted ? "最终确认后操作异常，正在核对订单" : "确认页操作未完成，未点击最终确认" });
       } finally {
         orderExecutionInProgress = false;
+        orderContextReservedUntil = 0;
       }
     }
     return send(response, 404, { error: "未找到本地浏览器会话接口" });
   } catch (error) {
     await updateStatus("error", `浏览器会话操作失败：${error.message}`);
     return send(response, 500, { error: status.message });
+  } finally {
+    releasePageOperation?.();
   }
 }).listen(port, host, () => console.log(`12306 browser session: http://${host}:${port}`));
 
