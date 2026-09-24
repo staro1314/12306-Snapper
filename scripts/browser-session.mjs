@@ -16,6 +16,10 @@ const loginUrl = "https://kyfw.12306.cn/otn/resources/login.html";
 const ORDER_CONFIRM_REQUEST_TIMEOUT_MS = 30_000;
 const ORDER_QUEUE_TIMEOUT_MS = 5 * 60_000;
 const ORDER_QUEUE_RESPONSE_TIMEOUT_MS = 35_000;
+// The observed direct-query probe has not yet met the live latency gate. Keep
+// production tasks on the verified official-page path until it does.
+const directQueryEnabled = process.env.FAST_12306_ENABLE_DIRECT_QUERY === "1";
+const DIRECT_QUERY_PROBE_TIMEOUT_MS = 3_000;
 // Real submission requires explicit per-task authorization and can be disabled process-wide.
 // The complete real pending-order flow is not yet an acceptance claim for this build.
 const realSubmissionEnabled = process.env.FAST_12306_ENABLE_REAL_SUBMISSION !== "0";
@@ -57,7 +61,8 @@ async function acquirePageOperation() {
 const pageOperationRoutes = new Set([
   "POST /start", "POST /logout", "GET /login/qr", "GET /stations", "POST /preflight",
   "GET /observe/account-links", "GET /observe/confirmation-handler", "POST /observe/passengers-page", "POST /observe/search-page",
-  "POST /observe/query", "POST /observe/order-initialize", "GET /observe/order-endpoints",
+  "POST /observe/passenger-match",
+  "POST /observe/query", "POST /observe/direct-query-probe", "POST /observe/order-initialize", "GET /observe/order-endpoints",
   "POST /observe/orders-page", "POST /orders/reconcile", "POST /orders/open",
   "GET /observe/confirm-profile", "POST /observe/passenger-controls", "POST /observe/order-ready", "POST /order/execute",
 ]);
@@ -609,6 +614,15 @@ http.createServer(async (request, response) => {
       updatePassengerSnapshot(body.data.datas);
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", page: "/otn/view/passengers.html", passengers: passengerSnapshot, entries: observations });
     }
+    if (request.method === "POST" && request.url === "/observe/passenger-match") {
+      if (status.state !== "logged_in" || passengerSecrets.size === 0) return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "请先登录并重新同步官方乘车人" });
+      const input = await readJsonBody(request);
+      if (typeof input.passengerName !== "string" || !input.passengerName.trim() || input.passengerName.length > 40) return send(response, 400, { error: "乘车人姓名无效" });
+      const matches = [...passengerSecrets].filter(([, passenger]) => passenger.passenger_name === input.passengerName.trim());
+      if (matches.length !== 1) return send(response, 409, { classification: "PASSENGER_REFERENCE_INVALID", matchCount: matches.length, error: "官方乘车人列表中未找到唯一的指定乘车人" });
+      const [passengerRef] = matches[0];
+      return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", matched: true, passengerRef, displayName: passengerSnapshot.find((item) => item.passengerRef === passengerRef)?.displayName ?? "乘客***" });
+    }
     if (request.method === "POST" && request.url === "/observe/search-page") {
       if (!page || page.isClosed()) return send(response, 409, { error: "请先打开并登录 12306" });
       observations.length = 0;
@@ -643,7 +657,7 @@ http.createServer(async (request, response) => {
         .then((request) => ({ request, observedAt: Date.now() })).catch(() => null);
       const responsePromise = page.waitForResponse(isOfficialQuery, { timeout: 15000 })
         .then((officialResponse) => ({ officialResponse, observedAt: Date.now() })).catch(() => null);
-      const directQueryUrl = status.state === "logged_in" ? reusableOfficialQueryUrl(officialQueryProfile, input) : null;
+      const directQueryUrl = directQueryEnabled && status.state === "logged_in" ? reusableOfficialQueryUrl(officialQueryProfile, input) : null;
       // A failed direct response must not leave the same profile eligible for blind reuse.
       if (directQueryUrl) officialQueryProfile = null;
       const queryClickStartedAt = Date.now();
@@ -652,9 +666,15 @@ http.createServer(async (request, response) => {
       // A direct query is permitted only for the exact route/date request observed from this
       // official page in this browser session. All other queries use the official button.
       if (directQueryUrl) {
-        await page.evaluate(async (url) => {
-          await fetch(url, { method: "GET", credentials: "include", cache: "no-store", headers: { "X-Requested-With": "XMLHttpRequest" } });
-        }, directQueryUrl);
+        await page.evaluate(async ({ url, timeoutMs }) => {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            await fetch(url, { method: "GET", credentials: "include", cache: "no-store", headers: { "X-Requested-With": "XMLHttpRequest" }, signal: controller.signal });
+          } finally {
+            clearTimeout(timeout);
+          }
+        }, { url: directQueryUrl, timeoutMs: DIRECT_QUERY_PROBE_TIMEOUT_MS });
       } else {
         // Observers are armed before clicking; do not await unrelated navigation.
         await page.locator("#query_ticket").click({ noWaitAfter: true });
@@ -694,6 +714,39 @@ http.createServer(async (request, response) => {
       latestQuery = { queryId: randomUUID(), input, candidates: rows.map(parseTicketCandidate) };
       const result = { path: new URL(apiResponse.url()).pathname, status: apiResponse.status(), queryMode: directQueryUrl ? "OBSERVED_DIRECT_REQUEST" : "OFFICIAL_PAGE_CLICK", responseKeys: Object.keys(body).sort(), dataKeys: body?.data && typeof body.data === "object" ? Object.keys(body.data).sort() : [], resultCount: rows.length, stationMapCount: body?.data?.map && typeof body.data.map === "object" ? Object.keys(body.data.map).length : null, queryId: latestQuery.queryId, success: body?.status === true, queryClickAwaitMs, queryRequestDelayMs: queryRequest ? queryRequest.observedAt - queryClickStartedAt : null, queryResponseRttMs: queryRequest ? observedQueryResponse.observedAt - queryRequest.observedAt : null, candidates: latestQuery.candidates.map(publicTicketCandidate) };
       return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", ...result });
+    }
+    if (request.method === "POST" && request.url === "/observe/direct-query-probe") {
+      if (!context || !page || page.isClosed() || status.state !== "logged_in") return send(response, 409, { classification: "USER_ACTION_REQUIRED", error: "请先登录 12306" });
+      const input = await readJsonBody(request);
+      const observedUrl = reusableOfficialQueryUrl(officialQueryProfile, input);
+      if (!observedUrl) return send(response, 409, { classification: "INCOMPATIBLE", error: "当前会话没有同路线、同日期的官方查询请求样本" });
+      // This probe is strictly read-only. It shares the browser cookie jar but never
+      // initializes or submits an order, and cannot validate final-order parameters.
+      latestQuery = null;
+      const remainingCooldown = 5100 - (Date.now() - lastOfficialQueryStartedAt);
+      if (remainingCooldown > 0) await page.waitForTimeout(remainingCooldown);
+      const startedAt = Date.now();
+      lastOfficialQueryStartedAt = startedAt;
+      try {
+        const officialResponse = await context.request.get(observedUrl, {
+          timeout: DIRECT_QUERY_PROBE_TIMEOUT_MS,
+          headers: { "X-Requested-With": "XMLHttpRequest", "Cache-Control": "no-cache" },
+        });
+        const contentType = officialResponse.headers()["content-type"] ?? "";
+        const body = contentType.includes("json") ? await officialResponse.json().catch(() => null) : null;
+        const compatible = officialResponse.status() === 200 && body?.status === true && Array.isArray(body?.data?.result);
+        return send(response, 200, {
+          source: "12306_OFFICIAL_READ_ONLY",
+          path: new URL(officialResponse.url()).pathname,
+          status: officialResponse.status(),
+          compatible,
+          classification: compatible ? "PASSED" : "INCOMPATIBLE",
+          resultCount: compatible ? body.data.result.length : null,
+          durationMs: Date.now() - startedAt,
+        });
+      } catch {
+        return send(response, 200, { source: "12306_OFFICIAL_READ_ONLY", compatible: false, classification: "QUERY_RESPONSE_UNKNOWN", durationMs: Date.now() - startedAt });
+      }
     }
     if (request.method === "POST" && request.url === "/observe/order-initialize") {
       if (!page || page.isClosed() || !latestQuery) return send(response, 409, { error: "请先完成一次余票查询" });
